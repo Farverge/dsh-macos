@@ -1,0 +1,794 @@
+import Foundation
+
+/// 管理 dsh 服务器进程：检测 / 启动 / 监控 / 停止
+@MainActor
+final class ServerManager: ObservableObject {
+    static let shared = ServerManager(appState: .shared)
+
+    @Published var status: ServerStatus = .unknown
+    @Published private(set) var serverProcess: Process?
+    @Published private(set) var lastCommand: String = ""
+
+    /// 本次运行中是否由我们启动了服务器（用于退出时决定是否停止）
+    private(set) var startedByUs = false
+
+    private let appState: AppState
+    private var pollTask: Task<Void, Never>?
+    private var stopping = false
+    private var outputPipe: Pipe?
+    private var updateLock = false
+    /// 是否正在执行 dsh 更新（下载/校验/重启阶段）。应用退出时应避免在
+    /// 更新过程中误杀刚换上的新后端，故对外暴露只读判断。
+    var isUpdating: Bool { updateLock }
+    /// 更新过程中的阶段/明细回调（UI 展示）
+    var onUpdateProgress: (@MainActor (String) -> Void)?
+    /// 镜像源（国内 CDN，比 registry.npmjs.org 快）
+    private let npmMirror = "https://registry.npmmirror.com"
+
+    init(appState: AppState) {
+        self.appState = appState
+    }
+
+    deinit {
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+    }
+
+    // MARK: - 检测
+
+    /// 检测目标端口上是否已有 DSH 实例在运行（attach 模式，不归我们管）。
+    /// 仅在我们没有亲自启动服务器时执行：否则会把 startedByUs 误置为
+    /// false，导致退出应用时本该带走的服务器变成孤儿进程。
+    func attach() async {
+        guard serverProcess == nil else { return }
+        let url = appState.url
+        let healthy = await isDSHInstance(url)
+        // 探测在途期间用户可能已手动点了启动（冷启动头几百毫秒内可行）：
+        // 以探测返回后的最新状态为准，否则会把我们自己刚拉起的服务器
+        // 误标为外部实例（startedByUs=false），退出时该带走的服务器变孤儿
+        guard serverProcess == nil else { return }
+        if healthy {
+            startedByUs = false
+            status = .running
+            startPolling()
+        } else if status != .starting {
+            // 用户可能在 attach 完成前手动点了“启动”（status=.starting），
+            // 此时不能把状态覆盖回 .stopped
+            status = .stopped
+        }
+    }
+
+    // MARK: - 启动 / 停止
+
+    func start() {
+        guard serverProcess == nil, status != .starting else { return }
+        stopping = false
+        status = .starting
+        lastCommand = appState.serverCommand
+
+        let command = appState.serverCommand
+        let port = AppState.defaultPort
+
+        Task {
+            do {
+                let resolved = try await Self.resolveCommand(command)
+                // 解析期间用户可能又点了启动/停止，防止重复 spawn
+                guard self.serverProcess == nil else {
+                    return
+                }
+                // 后端唯一性：spawn 前确认端口上没有已健康的 DSH 实例
+                //（外部终端启动的、或上一轮未收尾的）。已有实例则转为
+                // attach，绝不重复拉起第二个后端。
+                if await self.isDSHInstance(self.appState.url) {
+                    self.startedByUs = false
+                    self.status = .running
+                    self.startPolling()
+                    return
+                }
+                try spawn(resolved: resolved, port: port)
+                startPolling()
+            } catch {
+                // 启动失败必须回落状态面板显示错误原因：清掉上一轮遗留的
+                // “曾加载”标记，否则会短暂呈现空白 WebView + 断连横幅
+                appState.pageLoaded = false
+                status = .error("无法启动服务器：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func stop() {
+        guard let process = serverProcess else { return }
+        pollTask?.cancel()
+        pollTask = nil
+        stopping = true
+        status = .stopped
+        // 进程即将离开运行态：清掉“曾加载”标记，避免下次启动失败时
+        // 因陈旧标记误入“空白 WebView + 断连横幅”而不是错误面板
+        appState.pageLoaded = false
+        process.terminate()
+        // 3 秒内未退出则强杀。只强杀“当初决定要杀”的这一个进程：
+        // 若这 3 秒内用户重新点了启动，serverProcess 已指向新实例，
+        // 旧任务绝不能把新服务器误杀（用实例身份比对而非非空判断）。
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            guard self.serverProcess === process, process.isRunning else { return }
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
+    /// 同步停止并等待退出（用于应用退出 / 自测）
+    func stopAndWait() {
+        guard let process = serverProcess, process.isRunning else { return }
+        pollTask?.cancel()
+        pollTask = nil
+        stopping = true
+        process.terminate()
+        let deadline = Date().addingTimeInterval(4)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        outputPipe = nil
+        serverProcess = nil
+        status = .stopped
+        appState.pageLoaded = false
+    }
+
+    // MARK: - 进程
+
+    private func spawn(resolved: String, port: Int) throws {
+        // 端口边界保护：0 / 负值 / 越界会让应用连不上服务器
+        let safePort = min(max(port, 1), 65535)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        var full = resolved
+        // 追加 --no-open：dsh 的 web 子命令默认会在启动时自动打开默认浏览器（拉起 Safari），
+        // 这对"用原生 WebView 内置页面"的壳是多余且干扰的，故显式禁用外部开浏览器。
+        // 仅当命令是 web 场景（命令含 web / --profile web）时才注入；且用户已显式带 --no-open 时跳过。
+        let isWebCommand = full.contains("--profile web") || full.contains(" web") || full.hasPrefix("web")
+        if isWebCommand && !full.contains("--no-open") {
+            full += " --no-open"
+        }
+        if !full.contains("--port") {
+            full += " --port \(safePort)"
+        }
+        // exec 让 dsh 进程直接取代 shell，便于精确终止
+        process.arguments = ["-c", "exec \(full)"]
+
+        var env = ProcessInfo.processInfo.environment
+        // 保证 `#!/usr/bin/env node` 能找到 node / dsh
+        let binDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        let existing = env["PATH"] ?? ""
+        env["PATH"] = binDirs.joined(separator: ":") + ":" + existing
+        if env["DSH_HOME"] == nil {
+            env["DSH_HOME"] = "\(NSHomeDirectory())/.dsh"
+        }
+        process.environment = env
+
+        // 把服务器输出转发到应用 stdout，便于排障
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        outputPipe = pipe
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            FileHandle.standardOutput.write(data)
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.serverProcess === proc {
+                    self.outputPipe?.fileHandleForReading.readabilityHandler = nil
+                    self.outputPipe = nil
+                    self.serverProcess = nil
+                    if self.status != .starting {
+                        self.status = .stopped
+                    }
+                }
+            }
+        }
+
+        try process.run()
+        serverProcess = process
+        startedByUs = true
+    }
+
+    /// 只替换首个出现的首 token，避免命令里后续同名子串被误改
+    /// （如 “dsh --tag dsh” 会把参数里的第二个 dsh 也换成绝对路径）
+    private static func replacingFirst(_ source: String, _ target: String, with replacement: String) -> String {
+        guard let range = source.range(of: target) else { return source }
+        return source.replacingCharacters(in: range, with: replacement)
+    }
+
+    /// 把用户命令解析为一条**不依赖 PATH** 的绝对命令。
+    /// 关键背景：双击 .app 启动时进程由 launchd 拉起，PATH 只有系统目录
+    /// （没有 /opt/homebrew/bin，也没有 npx 缓存目录），所以不能指望
+    /// 终端里能用的 `dsh` 在双击场景也可用。解析结果会缓存到
+    /// UserDefaults，之后直接复用。
+    private static func resolveCommand(_ command: String) async throws -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { throw ServerError.emptyCommand }
+
+        let tokens = trimmed.split(separator: " ").map(String.init)
+        let first = tokens[0]
+
+        // 0. 缓存命中：上一次成功解析的绝对命令。除校验首 token 仍存在外，
+        //    还要求缓存记录的“配置命令原文”与当前设置一致——用户改了
+        //    启动命令后旧缓存必须作废，否则新设置永远不生效。
+        if let cached = UserDefaults.standard.string(forKey: "resolvedServerCommand"),
+           let cachedFirst = cached.split(separator: " ").first.map(String.init),
+           cachedFirst.hasPrefix("/"),
+           FileManager.default.fileExists(atPath: cachedFirst),
+           UserDefaults.standard.string(forKey: "resolvedServerCommandSource") == trimmed {
+            return cached
+        }
+
+        // 1. 用户直接给了绝对路径
+        if first.hasPrefix("/") {
+            cacheResolved(trimmed, source: trimmed)
+            return trimmed
+        }
+
+        // 2. 常见绝对位置
+        let candidates = ["/opt/homebrew/bin/\(first)", "/usr/local/bin/\(first)", "/usr/bin/\(first)", "/bin/\(first)"]
+        for candidate in candidates {
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                let resolved = replacingFirst(trimmed, first, with: candidate)
+                cacheResolved(resolved, source: trimmed)
+                return resolved
+            }
+        }
+
+        // 3. 登录 shell 的 PATH 解析（shellResolve 已注入常见 bin 目录）
+        if let resolved = await shellResolve(first) {
+            let full = replacingFirst(trimmed, first, with: resolved)
+            cacheResolved(full, source: trimmed)
+            return full
+        }
+
+        // 4. dsh 特化：绝对 node 直跑 npx 缓存里的 dsh 入口（完全离线、无 PATH 依赖）
+        if first == "dsh" {
+            if let direct = resolveNpxCachedDsh() {
+                let rest = tokens.dropFirst().joined(separator: " ")
+                let full = "\(direct) \(rest)".trimmingCharacters(in: .whitespaces)
+                cacheResolved(full, source: trimmed)
+                return full
+            }
+
+            // 5. 绝对 npx 兜底（spawn 时的 PATH 已含 /opt/homebrew/bin，npx 能找到 node）
+            for npx in ["/opt/homebrew/bin/npx", "/usr/local/bin/npx", "/usr/bin/npx"] {
+                if FileManager.default.isExecutableFile(atPath: npx) {
+                    let rest = tokens.dropFirst().joined(separator: " ")
+                    let full = "\(npx) --yes @deepseek-ai/dsh \(rest)".trimmingCharacters(in: .whitespaces)
+                    cacheResolved(full, source: trimmed)
+                    return full
+                }
+            }
+        }
+
+        throw ServerError.unresolvedCommand(trimmed)
+    }
+
+    // MARK: - 更新
+
+    /// 当前配置的 dsh 版本（从缓存的 package.json 读取）；nil = 未解析/不存在
+    var currentDSHVersion: String? {
+        let cached = UserDefaults.standard.string(forKey: "resolvedServerCommand")
+        guard let cached else { return nil }
+        // 命令形如 “node <绝对 bin 路径> --profile web”，bin 不一定是最后一个 token，
+        // 因此遍历每个绝对路径 token，找到能向上定位到 package.json 的那个。
+        for token in cached.split(separator: " ").map(String.init) where token.hasPrefix("/") {
+            var resolvedPath = token
+            if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: token),
+               dest.hasPrefix("/") {
+                resolvedPath = dest
+            }
+            var dir = URL(fileURLWithPath: resolvedPath).deletingLastPathComponent()
+            for _ in 0..<6 {
+                let candidate = dir.appendingPathComponent("package.json")
+                if FileManager.default.fileExists(atPath: candidate.path),
+                   let data = try? Data(contentsOf: candidate),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let version = json["version"] as? String {
+                    return version
+                }
+                let parent = dir.deletingLastPathComponent()
+                guard parent.path != dir.path else { break }
+                dir = parent
+            }
+        }
+        return nil
+    }
+
+    /// 联网查询 npm registry 最新 dsh 版本号（纯查询，不下载、不执行 dsh，避免 npx 进程爆炸）。
+    /// 使用 npm view，只拉取一个 registry JSON，不会触发 npm 包安装。
+    /// 注意：.app 从 Dock/Launchpad 启动时 PATH 只有系统目录，
+    /// 所以必须用绝对 npm 并注入 Homebrew bin，否则找不到 npm。
+    private func fetchLatestDSHVersion() async throws -> String {
+        let npmCandidates = ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/usr/bin/npm", "/bin/npm"]
+        guard let npm = npmCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw NSError(domain: "update", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "未找到 npm（请确保已安装 Node.js）"])
+        }
+        // 阻塞轮询放进同步的 nonisolated 静态函数，避免在 async 闭包内
+        // 使用 Thread.sleep 触发 Swift 6 并发告警
+        return try await Task.detached(priority: .userInitiated) {
+            try Self.queryNpmVersion(npm: npm)
+        }.value
+    }
+
+    /// 同步执行 `npm view @deepseek-ai/dsh version`，最多等待 30s。
+    /// 纯查询，单次 registry JSON 拉取，不会触发包安装。
+    private nonisolated static func queryNpmVersion(npm: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: npm)
+        process.arguments = ["view", "@deepseek-ai/dsh", "version"]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        // 网络查询最多等 30 秒
+        let deadline = Date().addingTimeInterval(30)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if process.isRunning {
+            process.terminate(); process.waitUntilExit()
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard process.terminationStatus == 0, !out.isEmpty else {
+            throw NSError(domain: "update", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "查询失败，请检查网络"])
+        }
+        return out
+    }
+
+    /// 下载最新 dsh（镜像 + 伪终端），返回解析出的版本号。
+    /// 阻塞逻辑跑在后台线程，进度经 progress 回调转发回 MainActor。
+    private func pullLatestDSHVersion() async throws -> String {
+        try Task.checkCancellation()
+        return try await Task.detached(priority: .userInitiated) { () -> String in
+            try Self._pull(mirror: self.npmMirror) { line in
+                Task { @MainActor in
+                    self.onUpdateProgress?(line)
+                }
+            }
+        }.value
+    }
+
+    /// 实际阻塞下载（nonisolated，可在后台线程执行）。不走 self 隔离状态，
+    /// 进度通过 progress 回调（已封装为主线程跳转）抛出。
+    private nonisolated static func _pull(
+        mirror: String,
+        progress: @escaping (String) -> Void
+    ) throws -> String {
+        let npxCandidates = ["/opt/homebrew/bin/npx", "/usr/local/bin/npx", "/usr/bin/npx", "/bin/npx"]
+        guard let npx = npxCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw NSError(domain: "update", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "未找到 npx（请确保已安装 Node.js）"])
+        }
+        // script -q /dev/null <cmd...>，分配 PTY 显真实进度
+        let script = "/usr/bin/script"
+        let args = ["-q", "/dev/null", npx, "--registry=\(mirror)", "--yes", "@deepseek-ai/dsh@latest", "--version"]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+        env["FORCE_COLOR"] = "1"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: script)
+        process.arguments = args
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        // 用引用类型承接累积输出，配合 NSLock 访问，避免 @Sendable 闭包捕获可变 var
+        final class OutputBox { var data = Data() }
+        let outBox = OutputBox()
+        let lock = NSLock()
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            lock.lock()
+            outBox.data.append(chunk)
+            let text = String(data: chunk, encoding: .utf8) ?? ""
+            // 转发给 UI（挑出可读行，过滤 ANSI 控制码）
+            let clean = text.replacingOccurrences(of: "\u{1B}[^m]*m", with: "", options: .regularExpression)
+            let lines = clean.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init)
+            for line in lines {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty {
+                    progress("  \(trimmed)")
+                }
+            }
+            lock.unlock()
+        }
+        // 等待并超时
+        let deadline = Date().addingTimeInterval(180)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if process.isRunning {
+            process.terminate(); process.waitUntilExit()
+        }
+        pipe.fileHandleForReading.readabilityHandler = nil
+        lock.lock()
+        let data = outBox.data
+        lock.unlock()
+        let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 校验：退出码 0 且输出含合法的 x.y.z（也可能带 -rc.N 后缀）
+        let versionPattern = #"\d+\.\d+\.\d+([-.][^\s]*)?(\s|$)"#
+        let valid = process.terminationStatus == 0 && !out.isEmpty && out.range(of: versionPattern, options: .regularExpression) != nil
+        guard valid else {
+            throw NSError(domain: "update", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "npx 拉取失败，请检查网络（原始输出：\(out.prefix(200)))"])
+        }
+        // 提取纯版本号（x.y.z 或 x.y.z-rc.N），忽略安装日志
+        let ver = out.firstMatch(of: #/\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.]*)?/#)
+        guard let v = ver.map({ String($0.0) }), !v.isEmpty else {
+            throw NSError(domain: "update", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "无法从输出解析版本号：\(out.prefix(120))"])
+        }
+        return v
+    }
+
+    /// 清理前必须跳过的 npx 缓存目录：
+    /// ① 当前解析命令指向的目录（本应用自己正在用）；
+    /// ② 任何运行中进程命令行引用的目录——npx 缓存是全机共享的，终端里
+    ///    可能正有别的会话跑在旧缓存上，删掉会让该进程后续的 spawn 直接失败。
+    private nonisolated static func protectedCacheDirs() -> Set<String> {
+        var protected = Set<String>()
+        let marker = "/node_modules/@deepseek-ai/dsh"
+        func note(_ token: String) {
+            guard token.hasPrefix("/"), let range = token.range(of: marker) else { return }
+            // 边界确认：包目录后必须是路径分隔符或字符串结尾，
+            // 防止 @deepseek-ai/dsh-something 这类前缀同名目录被误认；
+            // 也兼容命令行 token 恰好以包目录结尾（无尾斜杠）的情况
+            let next = token[range.upperBound...].first
+            guard next == nil || next == "/" else { return }
+            let entry = String(token[..<range.lowerBound])
+            protected.insert(entry)
+            protected.insert((entry as NSString).standardizingPath)
+        }
+        if let cached = UserDefaults.standard.string(forKey: "resolvedServerCommand") {
+            for token in cached.split(separator: " ").map(String.init) { note(token) }
+        }
+        if let out = runCapture("/bin/ps", ["-axo", "command="]) {
+            for line in out.split(whereSeparator: \.isNewline) {
+                for token in line.split(separator: " ").map(String.init) { note(token) }
+            }
+        }
+        return protected
+    }
+
+    /// 同步执行一个命令并捕获 stdout（用于 ps 快照；失败返回 nil）
+    private nonisolated static func runCapture(_ path: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// 清理旧版本与残缺缓存：保留 ~/.npm/_npx 中最新的 dsh，删除其余及残缺目录，
+    /// 返回清理明细。仅在下载完整校验通过后调用。
+    /// 使用中的缓存目录（见 protectedCacheDirs）一律跳过，绝不删除。
+    nonisolated func cleanupOldDSHCaches() -> String {
+        let npxRoot = "\(NSHomeDirectory())/.npm/_npx"
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: npxRoot) else {
+            return "无可清理的缓存目录（不存在 ~/.npm/_npx）"
+        }
+        let protectedDirs = Self.protectedCacheDirs()
+        struct Cand { let dir: String; let path: String; let mtime: Date }
+        var cands: [Cand] = []
+        var removed = 0
+        var removedBytes: Int64 = 0
+        var removedNames: [String] = []
+        var skippedInUse = 0
+        for entry in entries {
+            let dir = "\(npxRoot)/\(entry)"
+            // 使用中的目录（自己的或别的进程的）：整目录跳过，残缺也不碰
+            if protectedDirs.contains(dir) || protectedDirs.contains((dir as NSString).standardizingPath) {
+                skippedInUse += 1
+                continue
+            }
+            let dshPath = (dir as NSString).appendingPathComponent("node_modules/@deepseek-ai/dsh")
+            var isDir: ObjCBool = false
+            // 只处理含 dsh 的 _npx 缓存目录
+            guard FileManager.default.fileExists(atPath: dshPath, isDirectory: &isDir), isDir.boolValue else { continue }
+            // 该目录是否是“完整”的（存在 package.json 里的 version）
+            let pkg = (dshPath as NSString).appendingPathComponent("package.json")
+            let complete = FileManager.default.fileExists(atPath: pkg)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: dshPath)
+            let mtime = attrs?[.modificationDate] as? Date ?? .distantPast
+            cands.append(Cand(dir: dir, path: dshPath, mtime: mtime))
+            if !complete {
+                // 残缺目录直接删；只统计真正删除成功的，失败不虚报清理量
+                let size = dirSize(dir) ?? 0
+                do {
+                    try FileManager.default.removeItem(atPath: dir)
+                    removedBytes += size
+                    removed += 1
+                    removedNames.append(entry)
+                } catch {}
+            }
+        }
+        // 完整目录里保留最新，删其余（使用中的已在上面被排除）
+        let completeCands = cands.filter { FileManager.default.fileExists(atPath: ($0.path as NSString).appendingPathComponent("package.json")) }
+        if let newest = completeCands.max(by: { $0.mtime < $1.mtime }) {
+            for c in completeCands where c.dir != newest.dir {
+                // 同上：删除成功才计入统计
+                let size = dirSize(c.dir) ?? 0
+                do {
+                    try FileManager.default.removeItem(atPath: c.dir)
+                    removedBytes += size
+                    removed += 1
+                    removedNames.append(URL(fileURLWithPath: c.dir).lastPathComponent)
+                } catch {}
+            }
+        }
+        let skipNote = skippedInUse > 0 ? "；另保留 \(skippedInUse) 个使用中的缓存" : ""
+        guard removed > 0 else {
+            return skippedInUse > 0
+                ? "无需清理：其余缓存均在使用中（\(skippedInUse) 个已保留）"
+                : "无需清理：仅存在 1 份完整且最新的 dsh 缓存"
+        }
+        let names = removedNames.joined(separator: ", ")
+        let mb = Double(removedBytes) / 1_048_576.0
+        return String(format: "已清理 %d 个旧/残缺缓存（共约 %.1f MB）：%@", removed, mb, names + skipNote)
+    }
+
+    private nonisolated func dirSize(_ path: String) -> Int64? {
+        guard let urls = FileManager.default.enumerator(atPath: path) else { return nil }
+        var total: Int64 = 0
+        for case let url as String in urls {
+            let full = (path as NSString).appendingPathComponent(url)
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: full),
+               attrs[.type] as? FileAttributeType == .typeRegular,
+               let size = attrs[.size] as? Int64 {
+                total += size
+            }
+        }
+        return total
+    }
+
+    /// 检查 dsh 是否有新版：联网查询最新版本，与当前已装版本对比。
+    /// 有新版本回传版本号，没有新版回传 nil（此时不进入更新/重启流程）。
+    func checkDSHUpdate(_ callback: @escaping @MainActor (Result<String?, Error>) -> Void) {
+        guard !updateLock else { return }
+        updateLock = true
+        Task {
+            do {
+                let latest = try await fetchLatestDSHVersion()
+                await MainActor.run {
+                    self.updateLock = false
+                    if let current = self.currentDSHVersion, current == latest {
+                        callback(.success(nil)) // 无新版
+                    } else {
+                        callback(.success(latest)) // 有新版本（或当前版本未解析，视为可更新）
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.updateLock = false
+                    callback(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// 执行 DSH 更新并自动重启后端。
+    ///
+    /// 【完整流程】
+    ///   1. 镜像源 + 伪终端(PTY)下载 npx 到缓存，实时回传进度（onUpdateProgress）；
+    ///   2. 完整性校验（退出码 + 版本号 + package.json）；
+    ///   3. 校验通过后清理旧/残缺 ~/.npm/_npx 缓存，回传清理明细；
+    ///   4. 停掉旧服务器、清解析缓存、用最新缓存冷启动。
+    ///   任何一步失败都不碰服务器（继续旧的）。
+    func applyDSHUpdate(_ callback: @escaping @MainActor (Result<String, Error>) -> Void) {
+        guard !updateLock else { return }
+        updateLock = true
+        onUpdateProgress?("开始更新（镜像源加速 + 伪终端显示真实进度）…")
+        Task {
+            do {
+                // ① + ② 下载 + 完整性校验
+                let version = try await pullLatestDSHVersion()
+                onUpdateProgress?("✓ 下载完成并通过完整性校验：v\(version)")
+                // ③ 清理旧缓存（后台，不阻塞主线程）
+                var cleanupNote = "已跳过缓存清理"
+                let cleanupResult = await Task.detached(priority: .utility) {
+                    self.cleanupOldDSHCaches()
+                }.value
+                cleanupNote = cleanupResult
+                onUpdateProgress?("✓ 清理完成：\(cleanupNote)")
+                await MainActor.run {
+                    // ④ 停服 → 清解析缓存 → 冷启动
+                    if self.serverProcess != nil { self.stopAndWait() }
+                    UserDefaults.standard.removeObject(forKey: "resolvedServerCommand")
+                    UserDefaults.standard.removeObject(forKey: "resolvedServerCommandSource")
+                    self.status = .stopped
+                    self.forwardStart()
+                    self.updateLock = false
+                    callback(.success("\(version)（\(cleanupNote)）"))
+                }
+            } catch {
+                // 任一步失败：不碰服务器（继续旧的），只回传错误
+                await MainActor.run {
+                    self.updateLock = false
+                    onUpdateProgress?("✗ 更新失败：\(error.localizedDescription)")
+                    callback(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// 更新收尾时调用：等价于一次干净的 start()，但跳过端口预检的 attach 分支，
+    /// 确保用 npx 刚拉取的最新缓存 spawn 新进程。
+    private func forwardStart() {
+        guard serverProcess == nil else { return }
+        stopping = false
+        status = .starting
+        let command = appState.serverCommand
+        let port = AppState.defaultPort
+        Task {
+            do {
+                let resolved = try await Self.resolveCommand(command)
+                guard self.serverProcess == nil else { return }
+                // 更新场景：直接冷启动到最新缓存，不做端口 attach（端口应先已释放）
+                try self.spawn(resolved: resolved, port: port)
+                Self.cacheResolved(resolved, source: command.trimmingCharacters(in: .whitespaces))
+                self.startPolling()
+            } catch {
+                // 同 start()：重启失败要回落错误面板，不能吃陈旧的 pageLoaded
+                self.appState.pageLoaded = false
+                self.status = .error("重启失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 在 ~/.npm/_npx/<hash>/node_modules/@deepseek-ai/dsh/lib/bin.js 中
+    /// 定位 dsh 的真实入口（取最新的），返回 "绝对node 绝对bin.js"。
+    private static func resolveNpxCachedDsh() -> String? {
+        let npxRoot = "\(NSHomeDirectory())/.npm/_npx"
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: npxRoot) else { return nil }
+        var best: (Date, String)?
+        for entry in entries {
+            let binPath = "\(npxRoot)/\(entry)/node_modules/@deepseek-ai/dsh/lib/bin.js"
+            guard FileManager.default.fileExists(atPath: binPath) else { continue }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: binPath)
+            let mtime = attrs?[.modificationDate] as? Date ?? .distantPast
+            if best == nil || mtime > best!.0 {
+                best = (mtime, binPath)
+            }
+        }
+        guard let (_, binPath) = best else { return nil }
+        let nodeCandidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node", "/bin/node"]
+        guard let node = nodeCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
+        return "\(node) \(binPath)"
+    }
+
+    private static func cacheResolved(_ command: String, source: String) {
+        UserDefaults.standard.set(command, forKey: "resolvedServerCommand")
+        // 记录该解析结果来自哪条配置命令原文；配置变更后缓存即失效
+        //（见 resolveCommand 第 0 步的 source 比对）
+        UserDefaults.standard.set(source, forKey: "resolvedServerCommandSource")
+    }
+
+    private static func shellResolve(_ name: String) async -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "command -v \(name) 2>/dev/null || true"]
+        // launchd 环境下 PATH 极简（登录 shell 也未必有 Homebrew），先注入常见目录
+        var env = ProcessInfo.processInfo.environment
+        let binDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        let existing = env["PATH"] ?? ""
+        env["PATH"] = binDirs.joined(separator: ":") + ":" + existing
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let out = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (out?.isEmpty == false) ? out : nil
+    }
+
+    // MARK: - 健康监控
+
+    private func startPolling() {
+        pollTask?.cancel()
+        let url = appState.url
+        pollTask = Task { [weak self] in
+            guard let self else { return }
+            var consecutiveFailures = 0
+            while !Task.isCancelled {
+                // 服务器已停止（手动 stop / 进程退出）：结束轮询，避免空转
+                if self.status == .stopped { break }
+                let ok = await self.isHealthy(url)
+                if ok {
+                    consecutiveFailures = 0
+                    if self.status != .running {
+                        self.status = .running
+                    }
+                    try? await Task.sleep(for: .seconds(5))
+                } else {
+                    consecutiveFailures += 1
+                    if self.status == .running && consecutiveFailures >= 2 {
+                        self.status = .error("与服务器的连接中断")
+                    }
+                    // 启动阶段（starting）0.5s 加密轮询尽快发现就绪；
+                    // 其余状态 5s 慢轮询，避免空闲高频空转
+                    try? await Task.sleep(for: self.status == .starting ? .milliseconds(500) : .seconds(5))
+                }
+            }
+        }
+    }
+
+    func isHealthy(_ url: URL) async -> Bool {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                return true
+            }
+        } catch {
+            // 未连接
+        }
+        return false
+    }
+
+    /// 根 HTML 内嵌的官方启动脚本字面量。任何恰好占用 3080 的其它本地
+    /// HTTP 服务都不会带它——这是比“端口返回 200”强得多的身份证据。
+    static let identityMarker = "__DSH_BOOT__"
+
+    /// 身份确认：除健康检查外，还要求根页面确实是 DSH Web GUI，
+    /// 避免把同端口的陌生服务误认成后端而 attach。
+    func isDSHInstance(_ url: URL) async -> Bool {
+        guard await isHealthy(url) else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            return false
+        }
+        // lossy 解码：64KB 窗口若恰好截断多字节 UTF-8 序列，严格解码返回
+        // nil 会把真 DSH 误判成陌生服务；replacement 字符不影响标记查找
+        let html = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
+        return html.contains(Self.identityMarker)
+    }
+}
+
+enum ServerError: LocalizedError {
+    case emptyCommand
+    case unresolvedCommand(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyCommand:
+            return "启动命令为空"
+        case .unresolvedCommand(let command):
+            return "找不到命令：\(command)（请在设置中配置正确的启动命令）"
+        }
+    }
+}
