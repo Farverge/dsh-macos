@@ -116,7 +116,7 @@ struct HarnessWebView: NSViewRepresentable {
             isLoading = true
         }
 
-        // MARK: - 下载处理（WKWebView 不保存 <a download>，这里拦截导出请求由原生下载）
+        // MARK: - 导航策略
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -128,6 +128,22 @@ struct HarnessWebView: NSViewRepresentable {
                 }
                 return
             }
+
+            // 外部域名的主框架导航交给系统默认浏览器：官方界面里点击的任何
+            // 站外链接都不应占据壳窗口（否则整窗被外部页面接管且无可见退路）。
+            // 仅拦截主框架；页面内的外部子资源（字体/图片等）照常放行渲染。
+            // 本机 127.0.0.1 / localhost 的所有导航照常放行。
+            if navigationAction.targetFrame?.isMainFrame == true,
+               let url = navigationAction.request.url,
+               let host = url.host?.lowercased(),
+               host != "127.0.0.1", host != "localhost", !host.hasSuffix(".localhost") {
+                decisionHandler(.cancel)
+                Task { @MainActor in
+                    NSWorkspace.shared.open(url)
+                }
+                return
+            }
+
             decisionHandler(.allow)
         }
 
@@ -166,11 +182,20 @@ struct HarnessWebView: NSViewRepresentable {
             parent.onLoadState(.failed)
         }
 
-        /// 新窗口请求（target=_blank 等）直接在当前视图打开，避免弹窗
+        /// 新窗口请求（target=_blank / window.open）：外部站点交系统浏览器，
+        /// 本机地址仍在壳内打开——与主框架导航策略保持一致
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                      for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
             if navigationAction.targetFrame == nil {
-                webView.load(navigationAction.request)
+                if let url = navigationAction.request.url,
+                   let host = url.host?.lowercased(),
+                   host != "127.0.0.1", host != "localhost", !host.hasSuffix(".localhost") {
+                    Task { @MainActor in
+                        NSWorkspace.shared.open(url)
+                    }
+                } else {
+                    webView.load(navigationAction.request)
+                }
             }
             return nil
         }

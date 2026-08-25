@@ -31,7 +31,7 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSHumanReadableCopyright</key>
-    <string>© 2026 DSH Desktop 社区项目（非 DeepSeek 官方出品）详情请访问仓库链接：https://github.com/iiiiiei/DSH-MacOS</string>
+    <string>© 2026 DSH Desktop 社区项目（非 DeepSeek 官方出品）详情请访问仓库链接：https://github.com/Farverge/DSH-MacOS</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

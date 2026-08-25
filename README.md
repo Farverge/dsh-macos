@@ -14,10 +14,10 @@
 | [桌面效果](#桌面效果) | 浅色 / 深色模式实拍 |
 | [它是什么](#它是什么) | 功能清单与定位 |
 | [它是如何工作的](#它是如何工作的) | 四层架构与设计决策速览 |
-| [安全与风险](#安全与风险) | 公网暴露警示与本项目的安全边界 |
+| [安全与风险](#安全与风险) | 公网暴露警示 · 稳定化签名的边界 |
 | [注意事项](#注意事项) | 使用前提与已知边界 |
 | [免责声明](#免责声明) | 法律与担保条款 |
-| [查看更多](#查看更多) | Wiki 文档导航 |
+| [查看更多](#查看更多) | 完整文档（Wiki 单页版）章节导航 |
 | [友情链接](#友情链接) | 官方上游仓库 |
 | [许可证](#许可证) | 开源协议 |
 
@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 
 ## 它是什么
 
-- **内嵌官方 Web GUI**：WKWebView 加载本地 dsh 服务，沉浸式窗口跟随系统深浅色
+- **内嵌官方 Web GUI**：WKWebView 加载本地 dsh 服务，沉浸式窗口跟随系统深浅色；站外链接自动交给系统默认浏览器打开，壳内只保留官方界面
 - **后端进程全托管**：启动时以「HTTP 200 + 官方标记」双重身份探测已有实例并直接接管（绝不双开后端），六级命令解析链摆脱 PATH 依赖，健康轮询 + 断连横幅自动重试且不丢页面状态
 - **会话导出**：自动保存到「下载」文件夹并弹系统通知、定位文件
 - **桌面布局 overlay**：红绿灯锚定的沉浸式标题栏、折叠侧栏居中适配——纯 CSS 实现，跟随官方界面更新
@@ -76,24 +76,32 @@ Web 层     WKWebView 内嵌官方 GUI + 纯 CSS 布局 overlay
 桥接层     dsh-desktop-bridge 插件（status / notify 路由）
 ```
 
-核心思路：**官方 UI 是 Cordis 插件集，装进 WebView 就能自动获得全部桌面能力**。外壳只负责三件事——把网页装进原生窗口（含导出拦截、通知、断连保护）、替用户管好 node 后端的生命周期、用纯 CSS 把官方界面的几何对齐到 macOS 窗口规范（红绿灯锚定、侧栏居中）。完整分层说明与设计决策见 Wiki 的 Architecture 页。
+核心思路：**官方 UI 是 Cordis 插件集，装进 WebView 就能自动获得全部桌面能力**。外壳只负责三件事——把网页装进原生窗口（含导出拦截、通知、断连保护）、替用户管好 node 后端的生命周期、用纯 CSS 把官方界面的几何对齐到 macOS 窗口规范（红绿灯锚定、侧栏居中）。完整分层说明与设计决策见 Wiki。
 
 ## 安全与风险
 
-dsh 的 Web 控制平面**没有内置认证层**（无 token / cookie / TLS）。上游仓库的安全讨论（[deepseek-ai/deepseek-harness #853](https://github.com/deepseek-ai/deepseek-harness/discussions/853)）指出：其唯一的 Host/Origin 栅栏被源码自述为"不是认证层"，若把服务端口暴露到回环地址之外（端口转发、隧道、绑定 0.0.0.0 等），存在**未经身份验证的代码执行风险**——默认回环部署定级 High，非回环部署定级 Critical。奇安信等安全厂商亦有公开报道。
+dsh 的 Web 控制平面**没有内置认证层**（无 token / cookie / TLS）。上游仓库安全讨论 [#853](https://github.com/deepseek-ai/deepseek-harness/discussions/853) 指出：其唯一的 Host/Origin 栅栏被源码自述为"不是认证层"，若把服务端口暴露到回环地址之外（端口转发、隧道、绑定 0.0.0.0 等），存在未经身份验证的代码执行风险——默认回环部署定级 High，非回环部署定级 Critical。奇安信等安全厂商有公开报道。
 
-本项目的设计边界与你的使用准则：
+> [!WARNING]
+> 请勿将 3080 端口以任何形式暴露到回环地址之外：不做路由器端口映射，不使用 frp/ngrok 等隧道转发，不绑定 0.0.0.0。确需远程访问，必须自行叠加带认证的反向代理与 TLS，并自担全部风险。
+>
+> 本应用已将上述风险在架构层面收敛：后端固定绑定 127.0.0.1 回环地址，且不提供任何改绑公网接口的选项——公网暴露面在本项目中不存在。
 
-- ✅ 本应用**固定将后端绑定在 127.0.0.1（仅本机回环）**，不提供任何改绑公网接口的选项，天然规避公网暴露面
-- ✅ 请勿通过路由器端口映射、frp/ngrok 等隧道、反向代理把 3080 端口暴露到局域网或公网；确需远程使用，请自行叠加带认证的反代与 TLS，并自担风险
-- ✅ 及时通过设置内的「检查 DSH 更新」保持后端为最新版本，跟进上游安全修复
-- ⚠️ 与任何本地服务一样，本机其他恶意程序理论上可访问回环端口；请保持正常的 macOS 安全习惯
+关于本应用的分发签名，采用「稳定化 ad-hoc」方案（显式声明基于标识符的 Designated Requirement），其收益与需要知晓的风险如下：
+
+> [!IMPORTANT]
+> - **收益**：辅助功能等系统授权跨构建、跨版本持续有效，升级不再导致权限失效
+> - **放宽的身份校验**：授权规则从"精确到字节的哈希"放宽为"精确到 bundle 标识符"——理论上，一个声称相同标识符的被篡改二进制也能通过该规则校验。自用及信任链可控的场景下可接受，但请始终从本仓库 Releases 获取安装包
+> - **不构成分发信任**：该方案不等同于 Developer ID 公证。他人通过浏览器直接下载仍会被 Gatekeeper 拦截（推荐使用上方一键安装命令规避）
+> - **一次性迁移**：若曾用旧版 ad-hoc 签名并授予过系统权限，需执行一次 `tccutil reset Accessibility com.deepseek-ai.dsh-desktop` 并重新勾选，此后永久稳定
+
+> [!TIP]
+> 保持后端为最新版本是最重要的安全习惯：设置 → 关于 → 检查 DSH 更新。与任何本地回环服务一样，本机其他程序理论上可以访问 3080 端口，请维持常规的 macOS 安全习惯。
 
 ## 注意事项
 
 - 需要 **macOS 13+** 与 **Node.js**；端口固定使用 3080
 - 关闭窗口 ≠ 退出（Dock 常驻），彻底退出用 Cmd+Q；默认退出时会带走由应用启动的后端
-- 升级不影响系统授权（稳定化 ad-hoc 签名，identifier 规则跨构建有效）
 - 本项目按"现状"提供，更新后端依赖第三方镜像源与网络环境，请遵守所在地区法规及上游服务协议
 
 ## 免责声明
@@ -104,18 +112,19 @@ dsh 的 Web 控制平面**没有内置认证层**（无 token / cookie / TLS）�
 
 ## 查看更多
 
-完整文档托管于本仓库 Wiki（两镜像仓库内容一致）：
+除本 README 外的全部文档（架构、构建、使用、更新、安全、体检、FAQ、版本历史）已集中收录于 Wiki 单页，按章节直达：
 
-| 页面 | 内容 |
+| 章节 | 直达链接 |
 |---|---|
-| [Architecture（架构）](https://github.com/Farverge/DSH-MacOS/wiki/Architecture) | 分层设计、六级解析链、overlay v3 策略、设计决策全记录 |
-| [Build（构建）](https://github.com/Farverge/DSH-MacOS/wiki/Build) | 从源码构建、稳定化签名原理、发版资产约定 |
-| [Usage（使用）](https://github.com/Farverge/DSH-MacOS/wiki/Usage) | 安装、界面、设置、通知、导出全指南 |
-| [Update（更新）](https://github.com/Farverge/DSH-MacOS/wiki/Update) | 后端更新与应用更新的准确流程与排障 |
-| [Security（安全与风险）](https://github.com/Farverge/DSH-MacOS/wiki/Security) | 上游安全事件详情、本项目边界、加固清单 |
-| [Doctor（体检命令）](https://github.com/Farverge/DSH-MacOS/wiki/Doctor) | doctor 子命令的检查项、--fix 白名单与 agent 集成示例 |
-| [FAQ](https://github.com/Farverge/DSH-MacOS/wiki/FAQ) | 常见问题排查 |
-| [Changelog（版本历史）](https://github.com/Farverge/DSH-MacOS/wiki/Changelog) | v1.0.0 变更全记录 |
+| 一键安装（三段式详解） | [Wiki · 一键安装](https://github.com/Farverge/DSH-MacOS/wiki#一键安装) |
+| 使用指南 | [Wiki · 使用指南](https://github.com/Farverge/DSH-MacOS/wiki#使用指南) |
+| 架构 | [Wiki · 架构](https://github.com/Farverge/DSH-MacOS/wiki#架构) |
+| 构建与发版 | [Wiki · 构建与发版](https://github.com/Farverge/DSH-MacOS/wiki#构建与发版) |
+| 更新机制 | [Wiki · 更新机制](https://github.com/Farverge/DSH-MacOS/wiki#更新机制) |
+| 安全与风险 | [Wiki · 安全与风险](https://github.com/Farverge/DSH-MacOS/wiki#安全与风险) |
+| 体检命令 Doctor | [Wiki · 体检命令](https://github.com/Farverge/DSH-MacOS/wiki#体检命令-doctor) |
+| 常见问题 FAQ | [Wiki · FAQ](https://github.com/Farverge/DSH-MacOS/wiki#常见问题-faq) |
+| 版本历史 Changelog | [Wiki · 版本历史](https://github.com/Farverge/DSH-MacOS/wiki#版本历史-changelog) |
 
 ## 友情链接
 
