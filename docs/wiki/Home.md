@@ -7,7 +7,7 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 ```
 
 前提：macOS 13+、已安装 Node.js。
@@ -45,4 +45,4 @@ curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh |
 
 ---
 
-维护：iiiiiei · 许可：MIT · 免责声明见 README
+维护：DSH Desktop 社区 · 许可：MIT · 免责声明见 README

@@ -21,7 +21,7 @@
 ## 3. 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 ```
 
 或从 Releases 下载 `DSH.MacOS.Desktop.zip`，把 `DSH Desktop.app` 拖入应用程序文件夹。
