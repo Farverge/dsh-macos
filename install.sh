@@ -2,7 +2,7 @@
 # DSH Desktop 一键安装脚本
 #
 # 用法（README 展示的一行命令）：
-#   curl -fsSL https://raw.githubusercontent.com/iiiiiei/dsh-macos/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 #
 # 行为：查询 GitHub Releases 最新版 → 下载资产包 → 安装到 /Applications
 #      （无权限时回退 ~/Applications）→ 启动应用。
@@ -10,17 +10,17 @@
 # 前提：macOS 13+；应用运行需要 Node.js（终端 `node -v` 有输出）。
 set -euo pipefail
 
-REPO="iiiiiei/dsh-macos"
+REPO="Farverge/DSH-MacOS"
 APP_NAME="DSH Desktop.app"
 # 发版约定：每个 Release 附带此命名的 zip（内含根级 DSH Desktop.app）。
-# 资产名含空格：URL 中需编码为 %20（下方 ${ASSET// /%20} 纯 bash 替换）
-ASSET="DSH MacOS Desktop.zip"
+# 注意：GitHub 会把资产名中的空格替换为点号，故约定直接使用点号命名，
+# 与 Releases 页面展示名一致，无需任何 URL 编码。
+ASSET="DSH.MacOS.Desktop.zip"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> 查询最新版本…"
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET// /%20}"
-echo "    ${URL}"
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 echo "    ${URL}"
 
 echo "==> 下载…"

@@ -32,7 +32,7 @@
 curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh | bash
 ```
 
-- 或到 [Releases](https://github.com/iiiiiei/DSH-MacOS/releases) 手动下载 `DSH MacOS Desktop.zip`
+- 或到 [Releases](https://github.com/iiiiiei/DSH-MacOS/releases) 手动下载 `DSH.MacOS.Desktop.zip`
 - 应用内「检查应用更新」读取 GitHub Releases 最新 tag 与本地版本比对，只提示不自动安装；需仓库已有 Release
 
 ### 权限说明

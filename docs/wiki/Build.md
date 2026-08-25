@@ -49,13 +49,13 @@ curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh |
 原理与约定：
 
 - curl 下载的文件**不带隔离标记**，Gatekeeper 全程不介入，ad-hoc 签名直接可用
-- 脚本命中 Release 最新版的固定资产名 **`DSH MacOS Desktop.zip`**（URL 中空格编码为 %20）
+- 脚本命中 Release 最新版的固定资产名 **`DSH.MacOS.Desktop.zip`**（GitHub 会把空格归一化为点号，故直接用点号命名）
 - zip 内根级必须是 `DSH Desktop.app`
 - 打包命令：
 
 ```bash
 ditto -c -k --keepParent "build/DSH Desktop.app" DSH-MacOS-Release.zip
-# 重命名为 DSH MacOS Desktop.zip 后作为 Release 资产上传
+# 重命名为 DSH.MacOS.Desktop.zip 后作为 Release 资产上传
 ```
 
 可选补充：自建 Homebrew tap（仓库名必须为 `homebrew-*`，这是 brew 的硬性解析规则）获得 `brew search` 可发现性；对陌生下载者的无摩擦体验则需 Developer ID + 公证（未采用）。

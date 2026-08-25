@@ -24,7 +24,7 @@
 curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh | bash
 ```
 
-或从 Releases 下载 `DSH MacOS Desktop.zip`，把 `DSH Desktop.app` 拖入应用程序文件夹。
+或从 Releases 下载 `DSH.MacOS.Desktop.zip`，把 `DSH Desktop.app` 拖入应用程序文件夹。
 
 > 若浏览器下载版双击报"已损坏"：这是 macOS 对网络下载文件的隔离机制，执行 `xattr -cr "/Applications/DSH Desktop.app"` 即可；推荐改用上方一键命令，无此问题。
 

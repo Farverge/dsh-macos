@@ -14,7 +14,7 @@
 curl -fsSL https://raw.githubusercontent.com/iiiiiei/DSH-MacOS/main/install.sh | bash
 ```
 
-手动方式：到 [Releases](https://github.com/iiiiiei/DSH-MacOS/releases) 下载 `DSH MacOS Desktop.zip`，解压后把 `DSH Desktop.app` 拖入 /Applications。
+手动方式：到 [Releases](https://github.com/iiiiiei/DSH-MacOS/releases) 下载 `DSH.MacOS.Desktop.zip`，解压后把 `DSH Desktop.app` 拖入 /Applications。
 
 前提：**macOS 13+**、已安装 **Node.js**（终端 `node -v` 有输出）。应用启动时会自动拉起 dsh 后端。
 
