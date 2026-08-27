@@ -113,6 +113,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.applyWindowEnhancements()
             }
         }
+        // 迷你框三态判定支持（launcher 联动，v1 接入）：主窗口最小化/恢复/获焦时
+        // 经分布式通知向 Launcher 广播可见性。事件驱动零轮询；接收方是
+        // Launcher 的 VisibilityMonitor（内存布尔位，即用即弃）。
+        let broadcastVisibility: (Bool) -> Void = { visible in
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name("com.deepseek-ai.dsh-desktop.windowState"),
+                object: nil,
+                userInfo: ["visible": visible],
+                deliverImmediately: true
+            )
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didMiniaturizeNotification, object: nil, queue: .main
+        ) { note in
+            if let w = note.object as? NSWindow, w.title.hasPrefix("DSH Desktop") { broadcastVisibility(false) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didDeminiaturizeNotification, object: nil, queue: .main
+        ) { note in
+            if let w = note.object as? NSWindow, w.title.hasPrefix("DSH Desktop") { broadcastVisibility(true) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { note in
+            if let w = note.object as? NSWindow, w.title.hasPrefix("DSH Desktop") { broadcastVisibility(true) }
+        }
         // 窗口尺寸变化时跟随拖拽带（Low Memory：事件驱动，无轮询）
         NotificationCenter.default.addObserver(
             forName: NSWindow.didResizeNotification, object: nil, queue: .main

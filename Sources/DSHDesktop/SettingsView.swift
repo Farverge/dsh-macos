@@ -17,6 +17,9 @@ struct SettingsView: View {
     @State private var showUpdateLog = false
     // 菜单栏插件管理（轻量：仅打开设置/点刷新时读一次，无后台任务）
     @State private var pluginRunning = false
+    // Launcher 检查更新（卡3）：只在点按钮时联网，无常驻任务
+    @State private var isCheckingLauncher = false
+    @State private var launcherUpdateMessage: String?
 
     var body: some View {
         Form {
@@ -73,6 +76,27 @@ struct SettingsView: View {
                     Button("重新检测插件") {
                         MenuBarPluginManager.shared.refresh()
                         syncPluginState()
+                    }
+
+                    Divider()
+
+                    // 卡3 定稿：Launcher 的版本源 = Farverge/DSH-Launcher 的 Release
+                    // （与主应用的"检查 DSH 更新"是两条独立链路，不共用版本源）
+                    Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
+                        guard !isCheckingLauncher else { return }
+                        isCheckingLauncher = true
+                        launcherUpdateMessage = "正在联网检查 Farverge/DSH-Launcher 最新 Release…"
+                        checkLauncherUpdate(currentVersion: launcherLocalVersion()) { message in
+                            isCheckingLauncher = false
+                            launcherUpdateMessage = message
+                        }
+                    }
+                    .disabled(isCheckingLauncher)
+                    if let launcherUpdateMessage {
+                        Text(launcherUpdateMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                 }
                 .onAppear { syncPluginState() }
@@ -221,6 +245,45 @@ struct SettingsView: View {
         }
         pluginRunning = MenuBarPluginManager.shared.isRunning(bundleID)
     }
+
+    /// 本地 Launcher 版本：优先 manifest.json，退回其 Info.plist（主线程调用）
+    private func launcherLocalVersion() -> String {
+        if let v = MenuBarPluginManager.shared.manifest?.version, !v.isEmpty { return v }
+        let plistPath = NSHomeDirectory() + "/Library/Application Support/DSH Launcher.app/Contents/Info.plist"
+        if let dict = NSDictionary(contentsOfFile: plistPath),
+           let shortVersion = dict["CFBundleShortVersionString"] as? String {
+            return shortVersion
+        }
+        return ""
+    }
+}
+
+// 卡3：Launcher 检查更新——以 Farverge/DSH-Launcher 最新 Release 为版本源，
+// 与本地安装副本 manifest.json 里带的 version 比较；更新逻辑与安全性能参照
+// 主应用自身的"检查应用更新"模式（只提示，不代下载）。
+// currentVersion 由调用方（主线程）先取好——MenuBarPluginManager 是 @MainActor。
+func checkLauncherUpdate(currentVersion: String, _ completion: @escaping (String) -> Void) {
+    guard !currentVersion.isEmpty else {
+        completion("未找到已安装的 Launcher，请先安装后再检查。")
+        return
+    }
+    let url = URL(string: "https://api.github.com/repos/Farverge/DSH-Launcher/releases/latest")!
+    URLSession.shared.dataTask(with: url) { data, _, error in
+        DispatchQueue.main.async {
+            guard error == nil, let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let newestTag = obj["tag_name"] as? String else {
+                completion("无法检查 Launcher 更新（网络请求失败）")
+                return
+            }
+            let newest = newestTag.hasPrefix("v") ? String(newestTag.dropFirst()) : newestTag
+            if newest == currentVersion || newestTag == currentVersion {
+                completion("Launcher 已是最新版本：\(currentVersion)")
+            } else {
+                completion("发现新版 \(newestTag)（当前 \(currentVersion)）。请前往 https://github.com/Farverge/DSH-Launcher/releases 下载更新。")
+            }
+        }
+    }.resume()
 }
 
 
