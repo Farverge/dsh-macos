@@ -73,24 +73,26 @@ struct SettingsView: View {
                             }
                         ))
                     }
-                    Button("重新检测插件") {
-                        MenuBarPluginManager.shared.refresh()
-                        syncPluginState()
-                    }
-
                     // 卡3 定稿：Launcher 的版本源 = Farverge/DSH-Launcher 的 Release
                     // （与主应用的"检查 DSH 更新"是两条独立链路，不共用版本源）
-                    // 真机反馈：分组表单里 Divider 会渲染成一行空白，两个按钮直接相邻即可
-                    Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
-                        guard !isCheckingLauncher else { return }
-                        isCheckingLauncher = true
-                        launcherUpdateMessage = "正在联网检查 Farverge/DSH-Launcher 最新 Release…"
-                        checkLauncherUpdate(currentVersion: launcherLocalVersion()) { message in
-                            isCheckingLauncher = false
-                            launcherUpdateMessage = message
+                    // 真机 R2：分组表单给每个按钮各分配一行，相邻也留空——两个按钮
+                    // 并排进同一 HStack，空白行从结构上消失
+                    HStack(spacing: 12) {
+                        Button("重新检测插件") {
+                            MenuBarPluginManager.shared.refresh()
+                            syncPluginState()
                         }
+                        Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
+                            guard !isCheckingLauncher else { return }
+                            isCheckingLauncher = true
+                            launcherUpdateMessage = "正在联网检查 Farverge/DSH-Launcher 最新 Release…"
+                            checkLauncherUpdate(currentVersion: launcherLocalVersion()) { message in
+                                isCheckingLauncher = false
+                                launcherUpdateMessage = message
+                            }
+                        }
+                        .disabled(isCheckingLauncher)
                     }
-                    .disabled(isCheckingLauncher)
                     if let launcherUpdateMessage {
                         Text(launcherUpdateMessage)
                             .font(.caption)
