@@ -246,15 +246,10 @@ struct SettingsView: View {
         pluginRunning = MenuBarPluginManager.shared.isRunning(bundleID)
     }
 
-    /// 本地 Launcher 版本：优先 manifest.json，退回其 Info.plist（主线程调用）
+    /// 本地 Launcher 版本：优先 manifest.json，兜底读插件 .app 的 Info.plist（主线程调用）
     private func launcherLocalVersion() -> String {
         if let v = MenuBarPluginManager.shared.manifest?.version, !v.isEmpty { return v }
-        let plistPath = NSHomeDirectory() + "/Library/Application Support/DSH Launcher.app/Contents/Info.plist"
-        if let dict = NSDictionary(contentsOfFile: plistPath),
-           let shortVersion = dict["CFBundleShortVersionString"] as? String {
-            return shortVersion
-        }
-        return ""
+        return MenuBarPluginManager.shared.localAppVersion(bundleID: "com.deepseek-ai.dsh-launcher")
     }
 }
 
@@ -268,22 +263,47 @@ func checkLauncherUpdate(currentVersion: String, _ completion: @escaping (String
         return
     }
     let url = URL(string: "https://api.github.com/repos/Farverge/DSH-Launcher/releases/latest")!
-    URLSession.shared.dataTask(with: url) { data, _, error in
+    URLSession.shared.dataTask(with: url) { data, response, error in
         DispatchQueue.main.async {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard error == nil, let data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let newestTag = obj["tag_name"] as? String else {
-                completion("无法检查 Launcher 更新（网络请求失败）")
-                return
+                    // 404 = 仓库还没有任何 Release，属正常发布前状态，与网络故障区分开
+                    completion(status == 404
+                               ? "Farverge/DSH-Launcher 尚未发布任何版本（首个 Release 后即可正常检查）"
+                               : "无法检查 Launcher 更新（网络请求失败）")
+                    return
             }
             let newest = newestTag.hasPrefix("v") ? String(newestTag.dropFirst()) : newestTag
-            if newest == currentVersion || newestTag == currentVersion {
+            switch compareLauncherVersions(currentVersion, newest) {
+            case 0:
                 completion("Launcher 已是最新版本：\(currentVersion)")
-            } else {
+            case -1:
                 completion("发现新版 \(newestTag)（当前 \(currentVersion)）。请前往 https://github.com/Farverge/DSH-Launcher/releases 下载更新。")
+            default:
+                completion("当前 \(currentVersion) 比远端 \(newestTag) 更新（可能是预发布或本地构建），无需更新。")
             }
         }
     }.resume()
+}
+
+/// 语义化版本分段比较：逐段按数字比较（1.0.10 > 1.0.9）；带 -rc/-beta 等
+/// 预发布后缀的同号版本视作小于正式版（增量审计 P2-1）。返回 -1/0/1。
+func compareLauncherVersions(_ lhs: String, _ rhs: String) -> Int {
+    let preRelease = { (v: String) in v.lowercased().contains("-") }
+    let segments = { (v: String) -> [Int] in
+        let core = v.split(separator: "-").first.map(String.init) ?? v
+        return core.split(separator: ".").map { Int($0) ?? 0 }
+    }
+    let a = segments(lhs), b = segments(rhs)
+    for i in 0..<max(a.count, b.count) {
+        let av = i < a.count ? a[i] : 0
+        let bv = i < b.count ? b[i] : 0
+        if av != bv { return av < bv ? -1 : 1 }
+    }
+    if preRelease(lhs) != preRelease(rhs) { return preRelease(lhs) ? -1 : 1 }
+    return 0
 }
 
 

@@ -47,6 +47,15 @@ final class MenuBarPluginManager: ObservableObject {
         return nil
     }
 
+    /// 兜底读取插件 .app 的 CFBundleShortVersionString（manifest.json 缺失时用；
+    /// 设置页"检查 Launcher 更新"的本地版本即来源于此）
+    func localAppVersion(bundleID: String) -> String {
+        guard let app = appURL(bundleID: bundleID),
+              let plist = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist")),
+              let version = plist["CFBundleShortVersionString"] as? String else { return "" }
+        return version
+    }
+
     /// 打开设置时调用：读一次插件目录里「该 bundleID」对应 .app 的 manifest.json
     func refresh(bundleID: String = "com.deepseek-ai.dsh-launcher") {
         guard let app = appURL(bundleID: bundleID) else {

@@ -139,6 +139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { note in
             if let w = note.object as? NSWindow, w.title.hasPrefix("DSH Desktop") { broadcastVisibility(true) }
         }
+        // Cmd+H 应用级隐藏/恢复也计入可见性（增量审计 P2-5）。注意不监听
+        // didResignKey——设置窗口抢焦点等场景会误报"隐藏"。
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didHideNotification, object: nil, queue: .main
+        ) { _ in broadcastVisibility(false) }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didUnhideNotification, object: nil, queue: .main
+        ) { _ in broadcastVisibility(true) }
         // 窗口尺寸变化时跟随拖拽带（Low Memory：事件驱动，无轮询）
         NotificationCenter.default.addObserver(
             forName: NSWindow.didResizeNotification, object: nil, queue: .main
