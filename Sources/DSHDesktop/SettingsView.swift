@@ -78,10 +78,9 @@ struct SettingsView: View {
                         syncPluginState()
                     }
 
-                    Divider()
-
                     // 卡3 定稿：Launcher 的版本源 = Farverge/DSH-Launcher 的 Release
                     // （与主应用的"检查 DSH 更新"是两条独立链路，不共用版本源）
+                    // 真机反馈：分组表单里 Divider 会渲染成一行空白，两个按钮直接相邻即可
                     Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
                         guard !isCheckingLauncher else { return }
                         isCheckingLauncher = true
