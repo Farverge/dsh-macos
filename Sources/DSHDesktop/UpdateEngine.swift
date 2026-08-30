@@ -373,8 +373,9 @@ enum UpdateSafety {
         }
     }
 
-    /// 一键回滚：移除本次安装新增的缓存目录 → 快照恢复回原位 → 杀后端并等健康。
-    static func rollback() async throws -> String {
+    /// 一键回滚：移除新增目录 → 清除版本不符残留 → 原子恢复快照 → 自愈校验。
+    /// progress 逐行回报（经 ServerManager 转发到终端日志区）。
+    static func rollback(progress: @escaping (String) -> Void = { _ in }) async throws -> String {
         guard let data = try? Data(contentsOf: manifestURL),
               let manifest = try? JSONDecoder().decode(Manifest.self, from: data) else {
             throw NSError(domain: "update", code: 6,
@@ -382,12 +383,14 @@ enum UpdateSafety {
         }
         let fm = FileManager.default
         let npxRoot = fm.homeDirectoryForCurrentUser.appendingPathComponent(".npm/_npx")
-        // ① 移除新增目录
+
+        // ① 移除新增目录（FileManager 失败时 /bin/rm 兜底——实测有静默失败场景）
         for dir in manifest.installedNewDirs {
             try? fm.removeItem(at: npxRoot.appendingPathComponent(dir))
+            forceRemove(npxRoot.appendingPathComponent(dir))
         }
-        // ①' 清除版本不符的残留目录：回滚语义=回到快照版本。若残留目录携带其他版本
-        // （如缓存命中的 alpha 目录未进差集），解析器可能按 mtime 优先命中它 → 回滚失效
+        // ①' 清除版本不符残留：回滚语义=回到快照版本。残留异版本目录会被解析器
+        // 按 mtime 优先命中 → 回滚失效（实测踩坑）
         if let entries = try? fm.contentsOfDirectory(atPath: npxRoot.path) {
             for entry in entries {
                 let pkg = npxRoot.appendingPathComponent(entry)
@@ -395,23 +398,54 @@ enum UpdateSafety {
                 guard let data = try? Data(contentsOf: pkg),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let v = obj["version"] as? String, v != manifest.version else { continue }
+                progress("  清除异版本残留目录 \(entry)（v\(v)）")
                 try? fm.removeItem(at: npxRoot.appendingPathComponent(entry))
+                forceRemove(npxRoot.appendingPathComponent(entry))
             }
         }
-        // ② 恢复快照到原位（原目录可能被安装流程清理过，先确保父目录存在）
+
+        // ② 原子恢复：先拷到同级临时位 → 校验完整性 → 再换入原位。
+        // 【实测教训】"先删原位再拷"在快照内容异常时会留下空壳目录（入口丢失、
+        // 依赖被清），且尾部无条件清快照导致无法二次恢复。
         let dest = URL(fileURLWithPath: manifest.sourcePath)
-        try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? fm.removeItem(at: dest)   // 原位若有残留（同版本重装场景）先清
+        let staging = dest.deletingLastPathComponent().appendingPathComponent("__dsh_restore_staging")
+        try? fm.removeItem(at: staging)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        proc.arguments = [snapshotRoot.appendingPathComponent("package").path, dest.path]
+        proc.arguments = [snapshotRoot.appendingPathComponent("package").path, staging.path]
         try proc.run(); proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
+        guard proc.terminationStatus == 0,
+              fm.fileExists(atPath: staging.appendingPathComponent("lib/bin.js").path) else {
+            // 恢复材料不完整：保留快照供人工抢救，绝不清原位
             throw NSError(domain: "update", code: 6,
-                userInfo: [NSLocalizedDescriptionKey: "快照恢复失败（ditto 退出码 \(proc.terminationStatus)）"])
+                userInfo: [NSLocalizedDescriptionKey: "快照内容不完整（缺 lib/bin.js），已保留快照目录未动原位：\(snapshotRoot.path)"])
         }
+        try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.removeItem(at: dest)
+        try fm.moveItem(at: staging, to: dest)
+
+        // ③ 自愈校验：恢复位完整即可收尾；不完整则联网重装快照版本（pinned distTag
+        // = 具体版本号，npx 支持精确版本安装）
+        if !fm.fileExists(atPath: dest.appendingPathComponent("lib/bin.js").path) {
+            progress("  恢复位不完整，联网自愈重装 v\(manifest.version)…")
+            _ = try? await ServerManager.pullViaNpx(
+                registry: UpdateEngine.npmOfficial,
+                distTag: manifest.version,
+                progress: progress)
+        }
+        // ④ 快照收尾：仅在恢复/自愈完成后清除
         try? fm.removeItem(at: snapshotRoot)
         return manifest.version
+    }
+
+    /// 强删兜底：FileManager.removeItem 对运行中进程占用的目录偶发静默失败，
+    /// 退回 /bin/rm -rf（POSIX 语义对打开中的文件同样生效）
+    private static func forceRemove(_ target: URL) {
+        guard FileManager.default.fileExists(atPath: target.path) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/rm")
+        proc.arguments = ["-rf", target.path]
+        try? proc.run(); proc.waitUntilExit()
     }
 
     /// 回滚后由 ServerManager 调用：杀 3080 后端进程（外部实例也杀——回滚场景必须

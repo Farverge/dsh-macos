@@ -442,12 +442,15 @@ final class ServerManager: ObservableObject {
     /// 清理旧版本与残缺缓存：保留 ~/.npm/_npx 中最新的 dsh，删除其余及残缺目录，
     /// 返回清理明细。仅在下载完整校验通过后调用。
     /// 使用中的缓存目录（见 protectedCacheDirs）一律跳过，绝不删除。
-    nonisolated func cleanupOldDSHCaches() -> String {
+    nonisolated func cleanupOldDSHCaches(extraProtected: [String] = []) -> String {
         let npxRoot = "\(NSHomeDirectory())/.npm/_npx"
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: npxRoot) else {
             return "无可清理的缓存目录（不存在 ~/.npm/_npx）"
         }
-        let protectedDirs = Self.protectedCacheDirs()
+        var protectedDirs = Self.protectedCacheDirs()
+        // 【实测教训】更新中途的清理必须额外保护：快照源目录（回滚目标）与快照根。
+        // ps/defaults 两道保护在特定时序（外部实例 + 缓存被上轮更新改写）下同时失效
+        for extra in extraProtected { protectedDirs.insert(extra) }
         struct Cand { let dir: String; let path: String; let mtime: Date }
         var cands: [Cand] = []
         var removed = 0
@@ -582,7 +585,10 @@ final class ServerManager: ObservableObject {
                 // ③ 清理旧缓存（后台，不阻塞主线程）
                 var cleanupNote = "已跳过缓存清理"
                 let cleanupResult = await Task.detached(priority: .utility) {
-                    self.cleanupOldDSHCaches()
+                    self.cleanupOldDSHCaches(extraProtected: [
+                        snapshotManifest?.sourcePath ?? "",
+                        UpdateSafety.snapshotRoot.path,
+                    ].filter { !$0.isEmpty })
                 }.value
                 cleanupNote = cleanupResult
                 onUpdateProgress?("✓ 清理完成：\(cleanupNote)")
@@ -667,7 +673,9 @@ final class ServerManager: ObservableObject {
         onUpdateProgress?("── 开始回滚到更新前版本 ──")
         Task {
             do {
-                let restored = try await UpdateSafety.rollback()
+                let restored = try await UpdateSafety.rollback { line in
+                    Task { @MainActor in self.onUpdateProgress?(line) }
+                }
                 await UpdateSafety.killBackendForRollback()
                 await MainActor.run {
                     UserDefaults.standard.removeObject(forKey: "resolvedServerCommand")
