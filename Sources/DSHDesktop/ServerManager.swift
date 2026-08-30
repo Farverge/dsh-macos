@@ -23,7 +23,6 @@ final class ServerManager: ObservableObject {
     /// 更新过程中的阶段/明细回调（UI 展示）
     var onUpdateProgress: (@MainActor (String) -> Void)?
     /// 镜像源（国内 CDN，比 registry.npmjs.org 快）
-    private let npmMirror = "https://registry.npmmirror.com"
 
     init(appState: AppState) {
         self.appState = appState
@@ -305,53 +304,6 @@ final class ServerManager: ObservableObject {
         return nil
     }
 
-    /// 联网查询 npm registry 最新 dsh 版本号（纯查询，不下载、不执行 dsh，避免 npx 进程爆炸）。
-    /// 使用 npm view，只拉取一个 registry JSON，不会触发 npm 包安装。
-    /// 注意：.app 从 Dock/Launchpad 启动时 PATH 只有系统目录，
-    /// 所以必须用绝对 npm 并注入 Homebrew bin，否则找不到 npm。
-    private func fetchLatestDSHVersion() async throws -> String {
-        let npmCandidates = ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/usr/bin/npm", "/bin/npm"]
-        guard let npm = npmCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw NSError(domain: "update", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "未找到 npm（请确保已安装 Node.js）"])
-        }
-        // 阻塞轮询放进同步的 nonisolated 静态函数，避免在 async 闭包内
-        // 使用 Thread.sleep 触发 Swift 6 并发告警
-        return try await Task.detached(priority: .userInitiated) {
-            try Self.queryNpmVersion(npm: npm)
-        }.value
-    }
-
-    /// 同步执行 `npm view @deepseek-ai/dsh version`，最多等待 30s。
-    /// 纯查询，单次 registry JSON 拉取，不会触发包安装。
-    private nonisolated static func queryNpmVersion(npm: String) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: npm)
-        process.arguments = ["view", "@deepseek-ai/dsh", "version"]
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
-        process.environment = env
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        // 网络查询最多等 30 秒
-        let deadline = Date().addingTimeInterval(30)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        if process.isRunning {
-            process.terminate(); process.waitUntilExit()
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard process.terminationStatus == 0, !out.isEmpty else {
-            throw NSError(domain: "update", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "查询失败，请检查网络"])
-        }
-        return out
-    }
-
     /// v1.0.1：下载编排迁至 UpdateInstaller.install（三级链）；
     /// 进度转发收敛于此，供 applyDSHUpdate 使用。
     private func forwardProgress(_ line: String) {
@@ -593,6 +545,7 @@ final class ServerManager: ObservableObject {
                         _ callback: @escaping @MainActor (Result<String, Error>) -> Void) {
         guard !updateLock else { return }
         updateLock = true
+        var snapshotManifest: UpdateSafety.Manifest?
         onUpdateProgress?(distTag == "latest"
             ? "开始更新（稳定版通道 · 三级下载兜底）…"
             : "开始安装预发布版（alpha 通道 · 三级下载兜底）…")
@@ -600,8 +553,10 @@ final class ServerManager: ObservableObject {
             do {
                 // ⓪ 更新前快照（失败不阻断——仅失去一键回滚能力）
                 do {
-                    _ = try UpdateSafety.snapshotCurrent()
-                    onUpdateProgress?("✓ 已快照当前版本（回滚锚点就绪）")
+                    snapshotManifest = try UpdateSafety.snapshotCurrent()
+                    if let m = snapshotManifest {
+                        onUpdateProgress?("✓ 已快照 v\(m.version)（回滚锚点就绪）")
+                    }
                 } catch {
                     onUpdateProgress?("! 快照失败（不阻断更新，回滚将不可用）：\(error.localizedDescription)")
                 }
@@ -610,6 +565,12 @@ final class ServerManager: ObservableObject {
                     Task { @MainActor in self?.forwardProgress(line) }
                 }
                 onUpdateProgress?("✓ 下载完成并通过完整性校验：v\(installed)")
+                // ②' 登记安装新增的缓存目录（回滚移除名单）——必须在清理前完成差集
+                if snapshotManifest != nil {
+                    var m = snapshotManifest!
+                    UpdateSafety.recordNewDirs(&m)
+                    snapshotManifest = m
+                }
                 // ③ 清理旧缓存（后台，不阻塞主线程）
                 var cleanupNote = "已跳过缓存清理"
                 let cleanupResult = await Task.detached(priority: .utility) {

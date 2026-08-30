@@ -160,8 +160,7 @@ enum UpdateInstaller {
         let pkgDir = targetRoot.appendingPathComponent("node_modules/@deepseek-ai/dsh")
 
         do {
-            let code = try await curl("https://raw.tarball.invalid", version: version, to: tgz)
-            _ = code
+            try await curl(version: version, to: tgz)
             // 解包（tgz 顶层为 package/）与校验放到后台线程执行
             try await Task.detached(priority: .userInitiated) {
                 let fm = FileManager.default
@@ -193,8 +192,7 @@ enum UpdateInstaller {
         }
     }
 
-    private nonisolated static func curl(_ placeholder: String, version: String, to dest: URL) async throws -> Int32 {
-        _ = placeholder
+    private nonisolated static func curl(version: String, to dest: URL) async throws -> Int32 {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         proc.arguments = ["-fSL", "--max-time", "120", "--retry", "1",
@@ -259,8 +257,11 @@ enum UpdateSafety {
                   let data = try? Data(contentsOf: pkg.appendingPathComponent("package.json")),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let version = obj["version"] as? String else { continue }
-            if let bin = runningBin, pkg.path.hasPrefix(bin) {
-                return (pkg, version)   // 运行中实例优先，直接命中
+            if let bin = runningBin {
+                let binPkg = bin.hasSuffix("/lib/bin.js") ? String(bin.dropLast("/lib/bin.js".count)) : bin
+                if binPkg == pkg.path {
+                    return (pkg, version)   // 运行中实例优先，直接命中
+                }
             }
             let mtime = (try? fm.attributesOfItem(atPath: pkg.path)[.modificationDate] as? Date) ?? .distantPast
             if best == nil || mtime > best!.1 { best = (pkg, mtime) }
@@ -277,7 +278,7 @@ enum UpdateSafety {
     static func snapshotCurrent() throws -> Manifest? {
         guard let (pkg, version) = locateCurrentPackageDir() else { return nil }
         let fm = FileManager.default
-        try fm.removeItem(at: snapshotRoot)          // 幂等：清掉上次快照
+        try? fm.removeItem(at: snapshotRoot)         // 幂等：清掉上次快照（首跑目录不存在不视为错误）
         let copyDest = snapshotRoot.appendingPathComponent("package")
         try fm.createDirectory(at: snapshotRoot, withIntermediateDirectories: true)
         let proc = Process()
