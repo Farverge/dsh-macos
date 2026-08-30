@@ -275,8 +275,16 @@ final class ServerManager: ObservableObject {
 
     // MARK: - 更新
 
-    /// 当前配置的 dsh 版本（从缓存的 package.json 读取）；nil = 未解析/不存在
+    /// 当前 dsh 版本。优先取桥接在线报文（真实在跑的进程），桥接离线才回退解析缓存
+    /// ——【实测修正】纯读缓存会在更新失败/回滚后残留旧值（上次 alpha 尝试后标签
+    /// 一直显示 0.1.2-alpha.2，实际在跑 rc.2），进而影响"是否提示新版"的判定。
     var currentDSHVersion: String? {
+        if appState.bridgeConnected,
+           let range = appState.bridgeDetail.range(of: "v[0-9][0-9A-Za-z.\\-]*",
+                                                   options: .regularExpression) {
+            let live = appState.bridgeDetail[range].dropFirst()   // 去掉前导 v
+            if !live.isEmpty { return String(live) }
+        }
         let cached = UserDefaults.standard.string(forKey: "resolvedServerCommand")
         guard let cached else { return nil }
         // 命令形如 “node <绝对 bin 路径> --profile web”，bin 不一定是最后一个 token，
@@ -837,3 +845,4 @@ enum ServerError: LocalizedError {
         }
     }
 }
+
