@@ -127,20 +127,28 @@ enum UpdateInstaller {
         // T1：官方源 npx（PTY 实时进度沿用既有模式）
         progress("① 尝试 npm 官方源（npx @deepseek-ai/dsh@\(distTag)）…")
         do {
+            #if ROLLBACK_TEST
+            throw NSError(domain: "test", code: 99)
+            #else
             let v = try await ServerManager.pullViaNpx(registry: UpdateEngine.npmOfficial,
                                                        distTag: distTag, progress: progress)
             if SemVer.compare(v, version) == 0 { return v }
             progress("  官方源返回 v\(v) 与目标不符（同步异常），降级镜像重试…")
+            #endif
         } catch {
             progress("  官方源失败：\(error.localizedDescription)，降级镜像重试…")
         }
         // T2：镜像源 npx（历史稳定路径）
         progress("② 尝试 npmmirror 镜像（npx @deepseek-ai/dsh@\(distTag)）…")
         do {
+            #if ROLLBACK_TEST
+            throw NSError(domain: "test", code: 99)
+            #else
             let v = try await ServerManager.pullViaNpx(registry: UpdateEngine.npmMirror,
                                                        distTag: distTag, progress: progress)
             if SemVer.compare(v, version) == 0 { return v }
             progress("  镜像同步滞后（返回 v\(v)），降级官方 tarball 直链…")
+            #endif
         } catch {
             progress("  镜像失败：\(error.localizedDescription)，降级官方 tarball 直链…")
         }
@@ -222,9 +230,23 @@ enum UpdateInstaller {
 /// 更新安全网：装前快照、装后自检、失败一键回滚。
 /// 快照固定落位 ~/.npm/_npx-preupdate-snapshot/（manifest.json 记录来源与新增目录）。
 enum UpdateSafety {
+    #if ROLLBACK_TEST
+    /// 无头测试桩注入的沙盒根（仅测试构建）
+    static var testRoot: URL?
+    #endif
     static var snapshotRoot: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        #if ROLLBACK_TEST
+        if let testRoot { return testRoot.appendingPathComponent("_npx-preupdate-snapshot") }
+        #endif
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".npm/_npx-preupdate-snapshot")
+    }
+    static var npxRootForOps: URL {
+        #if ROLLBACK_TEST
+        if let testRoot { return testRoot.appendingPathComponent("_npx") }
+        #endif
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".npm/_npx")
     }
     static var manifestURL: URL { snapshotRoot.appendingPathComponent("manifest.json") }
 
@@ -382,7 +404,7 @@ enum UpdateSafety {
                 userInfo: [NSLocalizedDescriptionKey: "找不到更新前快照（manifest 缺失）"])
         }
         let fm = FileManager.default
-        let npxRoot = fm.homeDirectoryForCurrentUser.appendingPathComponent(".npm/_npx")
+        let npxRoot = npxRootForOps
 
         // ① 移除新增目录（FileManager 失败时 /bin/rm 兜底——实测有静默失败场景）
         for dir in manifest.installedNewDirs {
@@ -427,11 +449,15 @@ enum UpdateSafety {
         // ③ 自愈校验：恢复位完整即可收尾；不完整则联网重装快照版本（pinned distTag
         // = 具体版本号，npx 支持精确版本安装）
         if !fm.fileExists(atPath: dest.appendingPathComponent("lib/bin.js").path) {
+            #if ROLLBACK_TEST
+            progress("  [测试] 恢复位不完整（跳过联网自愈）")
+            #else
             progress("  恢复位不完整，联网自愈重装 v\(manifest.version)…")
             _ = try? await ServerManager.pullViaNpx(
                 registry: UpdateEngine.npmOfficial,
                 distTag: manifest.version,
                 progress: progress)
+            #endif
         }
         // ④ 快照收尾：仅在恢复/自愈完成后清除
         try? fm.removeItem(at: snapshotRoot)
