@@ -15,6 +15,11 @@ struct SettingsView: View {
     @State private var showUpdateConfirm = false
     @State private var updateLog: [String] = []
     @State private var showUpdateLog = false
+    // v1.0.1：alpha 通道与自检回滚
+    @State private var pendingAlpha: String?
+    @State private var showAlphaConfirm = false
+    @State private var selfCheckFailures: [CheckResult]?
+    @State private var showRollbackConfirm = false
     // 菜单栏插件管理（轻量：仅打开设置/点刷新时读一次，无后台任务）
     @State private var pluginRunning = false
     // Launcher 检查更新（卡3）：只在点按钮时联网，无常驻任务
@@ -118,81 +123,7 @@ struct SettingsView: View {
                 LabeledContent("DSH Desktop", value: appVersion)
                 LabeledContent("DSH 版本", value: server.currentDSHVersion ?? "待服务器启动后显示")
                 LabeledContent("最低系统", value: "macOS 13+")
-                if let updateMessage {
-                    Text(updateMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                // 终端风格的更新日志（进度实时追加）
-                if showUpdateLog {
-                    Text("下载在后台独立进程进行；关闭应用不会中断下载。下载完成并通过完整性校验后，会自动清理旧版与破损缓存并重启后端。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(updateLog, id: \.self) { line in
-                                Text(line)
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .padding(6)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(height: 180)
-                    .background(Color.black.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                }
-                Button(isUpdatingDSH ? "更新中…" : "检查 DSH 更新（联网拉最新版）") {
-                    guard !isUpdatingDSH else { return }
-                    isUpdatingDSH = true
-                    updateMessage = "正在联网检查最新 dsh…"
-                    // 先查询并对比版本：无新版直接结束，绝不停服
-                    server.checkDSHUpdate { result in
-                        switch result {
-                        case .success(let latest):
-                            if let latest {
-                                isUpdatingDSH = false
-                                pendingLatest = latest
-                                updateMessage = "发现新版本 \(latest)（当前 \(server.currentDSHVersion ?? "未解析")）。确认后才会更新重启。"
-                                showUpdateConfirm = true
-                            } else {
-                                isUpdatingDSH = false
-                                updateMessage = "DSH 已是最新版本"
-                            }
-                        case .failure(let e):
-                            isUpdatingDSH = false
-                            updateMessage = "检查失败：\(e.localizedDescription)"
-                        }
-                    }
-                }
-                .disabled(isUpdatingDSH)
-                .alert("发现新版本", isPresented: $showUpdateConfirm, presenting: pendingLatest) { latest in
-                    Button("现在更新并重启") {
-                        isUpdatingDSH = true
-                        updateLog = []
-                        showUpdateLog = true
-                        updateMessage = "正在更新到 \(latest)，下载进度见下方终端…"
-                        // 挂实时进度回调
-                        server.onUpdateProgress = { line in
-                            updateLog.append(line)
-                        }
-                        server.applyDSHUpdate { r in
-                            server.onUpdateProgress = nil
-                            isUpdatingDSH = false
-                            switch r {
-                            case .success(let v):
-                                updateMessage = "DSH 已更新到 \(v)，正在自动启动新的后端…"
-                            case .failure(let e):
-                                updateMessage = "更新失败：\(e.localizedDescription)"
-                            }
-                        }
-                    }
-                    Button("取消", role: .cancel) {}
-                } message: { latest in
-                    Text("是否下载 dsh \(latest) 并自动重启后端？\n\n下载在后台独立进程进行——即使关闭应用，下载进程也不会中断，会继续完成。")
-                }
+                dshUpdateControls
                 Button(isCheckingApp ? "检查中…" : "检查应用更新") {
                     guard !isCheckingApp else { return }
                     isCheckingApp = true
@@ -215,6 +146,185 @@ struct SettingsView: View {
         }
         .onDisappear {
             appState.saveSettings()
+        }
+    }
+
+    /// DSH 更新 UI（v1.0.1：拆为小组件，规避 SwiftUI 大表达式类型检查超时）
+    @ViewBuilder
+    private var dshUpdateControls: some View {
+        updateStatusArea
+        updateCheckButton
+        if let alpha = pendingAlpha, !showUpdateConfirm {
+            alphaInstallButton(alpha)
+        }
+        rollbackAlertAnchor
+    }
+
+    /// 进度文案 + 终端风格日志
+    @ViewBuilder
+    private var updateStatusArea: some View {
+        if let updateMessage {
+            Text(updateMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if showUpdateLog {
+            Text("下载在后台独立进程进行；关闭应用不会中断下载。下载完成并通过完整性校验后，会自动清理旧版与破损缓存并重启后端。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(updateLog, id: \.self) { line in
+                        Text(line)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 180)
+            .background(Color.black.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    /// 检查按钮（rc 稳定版确认弹窗挂在此处）
+    private var updateCheckButton: some View {
+        Button(isUpdatingDSH ? "更新中…" : "检查 DSH 更新（联网拉最新版）") {
+            guard !isUpdatingDSH else { return }
+            isUpdatingDSH = true
+            updateMessage = "正在联网检查最新 dsh…"
+            server.checkDSHUpdate { result in
+                handleCheckResult(result)
+            }
+        }
+        .disabled(isUpdatingDSH)
+        .alert("发现新版本", isPresented: $showUpdateConfirm, presenting: pendingLatest) { latest in
+            Button("现在更新并重启") {
+                startUpdate(distTag: "latest", version: latest)
+            }
+            Button("取消", role: .cancel) {}
+        } message: { latest in
+            Text("是否下载 dsh \(latest) 并自动重启后端？（稳定版通道）\n\n下载在后台独立进程进行——即使关闭应用，下载进程也不会中断，会继续完成。")
+        }
+    }
+
+    /// alpha 安装按钮（独立确认弹窗，警示样式）
+    private func alphaInstallButton(_ alpha: String) -> some View {
+        Button("安装预发布版 \(alpha)…") {
+            showAlphaConfirm = true
+        }
+        .disabled(isUpdatingDSH)
+        .alert("安装预发布版？", isPresented: $showAlphaConfirm) {
+            Button("仍要安装", role: .destructive) {
+                startUpdate(distTag: "alpha", version: alpha)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("预发布版本可能不稳定，生产环境请使用稳定版。\n\n已知影响（\(alpha)）：\n· 浏览器认证链启用——旧版壳可能出现页面 401\n\n安装后将自动运行兼容性自检；未通过可一键回滚到当前版本。")
+        }
+    }
+
+    /// 回滚弹窗（锚定在隐藏视图上，与其它弹窗互不嵌套）
+    private var rollbackAlertAnchor: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .alert("更新后自检未通过", isPresented: $showRollbackConfirm, presenting: selfCheckFailures) { failures in
+                Button("回滚到更新前版本并重启", role: .destructive) {
+                    performRollback()
+                }
+                Button("暂不处理") {}
+                Button("重试自检") {
+                    retrySelfCheck()
+                }
+            } message: { failures in
+                Text(failures.map { "· \($0.name)：\($0.detail)" }.joined(separator: "\n")
+                     + "\n\n建议回滚；也可暂不处理（保持新版本继续运行）或重试自检。")
+            }
+    }
+
+    /// 三级查询结果 → UI 状态
+    private func handleCheckResult(_ result: Result<UpdateAvailability, Error>) {
+        isUpdatingDSH = false
+        switch result {
+        case .success(let availability):
+            let current = server.currentDSHVersion ?? ""
+            let upToDate = availability.stable.map { current.isEmpty || SemVer.compare(current, $0) >= 0 } ?? true
+            pendingAlpha = nil
+            if upToDate {
+                updateMessage = "DSH 已是最新版本（\(availability.source.rawValue)）"
+            } else if let stable = availability.stable {
+                pendingLatest = stable
+                updateMessage = "发现新版本 \(stable)（当前 \(current.isEmpty ? "未解析" : current)，稳定版通道）。确认后才会更新重启。"
+                showUpdateConfirm = true
+            }
+            if let alpha = availability.alpha,
+               current.isEmpty || SemVer.compare(current, alpha) < 0 {
+                pendingAlpha = alpha
+                updateMessage = (updateMessage ?? "") + "\n发现预发布 \(alpha)（alpha 通道 · 体验新特性，可能不稳定）。"
+            }
+        case .failure(let e):
+            updateMessage = "检查失败：\(e.localizedDescription)"
+        }
+    }
+
+    /// 统一启动更新/安装（rc 与 alpha 共用管线，弹窗已在上游区分）
+    private func startUpdate(distTag: String, version: String) {
+        isUpdatingDSH = true
+        updateLog = []
+        showUpdateLog = true
+        updateMessage = distTag == "latest"
+            ? "正在更新到 \(version)，下载进度见下方终端…"
+            : "正在安装预发布版 \(version)（alpha 通道）…"
+        server.onUpdateProgress = { line in updateLog.append(line) }
+        server.applyDSHUpdate(distTag: distTag, version: version) { r in
+            server.onUpdateProgress = nil
+            isUpdatingDSH = false
+            handleUpdateResult(r)
+        }
+    }
+
+    private func performRollback() {
+        isUpdatingDSH = true
+        updateMessage = "正在回滚…"
+        server.onUpdateProgress = { line in updateLog.append(line) }
+        server.rollbackFromFailedUpdate { r in
+            server.onUpdateProgress = nil
+            isUpdatingDSH = false
+            switch r {
+            case .success(let v):
+                updateMessage = "已回滚至 v\(v) 并重启后端。"
+            case .failure(let e):
+                updateMessage = "回滚失败：\(e.localizedDescription)（快照可能已损坏，建议重装稳定版）"
+            }
+        }
+    }
+
+    private func retrySelfCheck() {
+        Task { @MainActor in
+            let results = await UpdateSafety.selfCheck()
+            if results.allSatisfy(\.ok) {
+                updateMessage = "重试自检：3/3 通过，新版本运行正常。"
+            } else {
+                selfCheckFailures = results
+                showRollbackConfirm = true
+            }
+        }
+    }
+
+    /// 更新/安装结果统一出口：自检未通过 → 回滚弹窗；普通失败 → 文案。
+    private func handleUpdateResult(_ r: Result<String, Error>) {
+        switch r {
+        case .success(let v):
+            updateMessage = "DSH 已更新到 \(v)。"
+        case .failure(let e as SelfCheckFailure):
+            selfCheckFailures = e.results
+            showRollbackConfirm = true
+            updateMessage = "更新完成但自检未通过（\(e.failures.count)/3 项失败），请选择处理方式。"
+        case .failure(let e):
+            updateMessage = "更新失败：\(e.localizedDescription)"
         }
     }
 

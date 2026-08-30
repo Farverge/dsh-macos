@@ -352,23 +352,18 @@ final class ServerManager: ObservableObject {
         return out
     }
 
-    /// 下载最新 dsh（镜像 + 伪终端），返回解析出的版本号。
-    /// 阻塞逻辑跑在后台线程，进度经 progress 回调转发回 MainActor。
-    private func pullLatestDSHVersion() async throws -> String {
-        try Task.checkCancellation()
-        return try await Task.detached(priority: .userInitiated) { () -> String in
-            try Self._pull(mirror: self.npmMirror) { line in
-                Task { @MainActor in
-                    self.onUpdateProgress?(line)
-                }
-            }
-        }.value
+    /// v1.0.1：下载编排迁至 UpdateInstaller.install（三级链）；
+    /// 进度转发收敛于此，供 applyDSHUpdate 使用。
+    private func forwardProgress(_ line: String) {
+        onUpdateProgress?(line)
     }
 
     /// 实际阻塞下载（nonisolated，可在后台线程执行）。不走 self 隔离状态，
     /// 进度通过 progress 回调（已封装为主线程跳转）抛出。
-    private nonisolated static func _pull(
-        mirror: String,
+    /// v1.0.1：泛化为 registry + distTag 两参（三级安装链的 T1/T2 复用本函数）。
+    nonisolated static func pullViaNpx(
+        registry: String,
+        distTag: String,
         progress: @escaping (String) -> Void
     ) throws -> String {
         let npxCandidates = ["/opt/homebrew/bin/npx", "/usr/local/bin/npx", "/usr/bin/npx", "/bin/npx"]
@@ -378,7 +373,7 @@ final class ServerManager: ObservableObject {
         }
         // script -q /dev/null <cmd...>，分配 PTY 显真实进度
         let script = "/usr/bin/script"
-        let args = ["-q", "/dev/null", npx, "--registry=\(mirror)", "--yes", "@deepseek-ai/dsh@latest", "--version"]
+        let args = ["-q", "/dev/null", npx, "--registry=\(registry)", "--yes", "@deepseek-ai/dsh@\(distTag)", "--version"]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
         env["NODE_OPTIONS"] = "--max-old-space-size=4096"
@@ -568,25 +563,20 @@ final class ServerManager: ObservableObject {
 
     /// 检查 dsh 是否有新版：联网查询最新版本，与当前已装版本对比。
     /// 有新版本回传版本号，没有新版回传 nil（此时不进入更新/重启流程）。
-    func checkDSHUpdate(_ callback: @escaping @MainActor (Result<String?, Error>) -> Void) {
+    /// v1.0.1：三级查询（官方→镜像→GitHub），回调携带稳定线+预发布线。
+    func checkDSHUpdate(_ callback: @escaping @MainActor (Result<UpdateAvailability, Error>) -> Void) {
         guard !updateLock else { return }
         updateLock = true
         Task {
-            do {
-                let latest = try await fetchLatestDSHVersion()
-                await MainActor.run {
-                    self.updateLock = false
-                    if let current = self.currentDSHVersion, current == latest {
-                        callback(.success(nil)) // 无新版
-                    } else {
-                        callback(.success(latest)) // 有新版本（或当前版本未解析，视为可更新）
-                    }
+            let availability = await UpdateEngine.fetchAvailability()
+            await MainActor.run {
+                self.updateLock = false
+                guard availability.stable != nil else {
+                    callback(.failure(NSError(domain: "update", code: 7,
+                        userInfo: [NSLocalizedDescriptionKey: "版本查询失败：三级来源（npm 官方/镜像/GitHub）均不可达"])))
+                    return
                 }
-            } catch {
-                await MainActor.run {
-                    self.updateLock = false
-                    callback(.failure(error))
-                }
+                callback(.success(availability))
             }
         }
     }
@@ -599,15 +589,27 @@ final class ServerManager: ObservableObject {
     ///   3. 校验通过后清理旧/残缺 ~/.npm/_npx 缓存，回传清理明细；
     ///   4. 停掉旧服务器、清解析缓存、用最新缓存冷启动。
     ///   任何一步失败都不碰服务器（继续旧的）。
-    func applyDSHUpdate(_ callback: @escaping @MainActor (Result<String, Error>) -> Void) {
+    func applyDSHUpdate(distTag: String = "latest", version: String,
+                        _ callback: @escaping @MainActor (Result<String, Error>) -> Void) {
         guard !updateLock else { return }
         updateLock = true
-        onUpdateProgress?("开始更新（镜像源加速 + 伪终端显示真实进度）…")
+        onUpdateProgress?(distTag == "latest"
+            ? "开始更新（稳定版通道 · 三级下载兜底）…"
+            : "开始安装预发布版（alpha 通道 · 三级下载兜底）…")
         Task {
             do {
-                // ① + ② 下载 + 完整性校验
-                let version = try await pullLatestDSHVersion()
-                onUpdateProgress?("✓ 下载完成并通过完整性校验：v\(version)")
+                // ⓪ 更新前快照（失败不阻断——仅失去一键回滚能力）
+                do {
+                    _ = try UpdateSafety.snapshotCurrent()
+                    onUpdateProgress?("✓ 已快照当前版本（回滚锚点就绪）")
+                } catch {
+                    onUpdateProgress?("! 快照失败（不阻断更新，回滚将不可用）：\(error.localizedDescription)")
+                }
+                // ① + ② 三级下载（官方 npx → 镜像 npx → 官方 tarball 直链）+ 完整性校验
+                let installed = try await UpdateInstaller.install(distTag: distTag, version: version) { [weak self] line in
+                    Task { @MainActor in self?.forwardProgress(line) }
+                }
+                onUpdateProgress?("✓ 下载完成并通过完整性校验：v\(installed)")
                 // ③ 清理旧缓存（后台，不阻塞主线程）
                 var cleanupNote = "已跳过缓存清理"
                 let cleanupResult = await Task.detached(priority: .utility) {
@@ -615,21 +617,82 @@ final class ServerManager: ObservableObject {
                 }.value
                 cleanupNote = cleanupResult
                 onUpdateProgress?("✓ 清理完成：\(cleanupNote)")
+                // ④ 停服 → 清解析缓存 → 冷启动（新版本接管端口）
                 await MainActor.run {
-                    // ④ 停服 → 清解析缓存 → 冷启动
                     if self.serverProcess != nil { self.stopAndWait() }
                     UserDefaults.standard.removeObject(forKey: "resolvedServerCommand")
                     UserDefaults.standard.removeObject(forKey: "resolvedServerCommandSource")
                     self.status = .stopped
                     self.forwardStart()
+                }
+                // ⑤ 等新后端就绪（最多 30s，任何 HTTP 响应都算监听成功）再自检
+                let backendUp = await Self.waitBackendResponding(timeout: 30)
+                onUpdateProgress?(backendUp
+                    ? "✓ 新后端已监听，开始兼容性自检…"
+                    : "! 后端 30s 内未响应，仍执行自检记录现状…")
+                let results = await UpdateSafety.selfCheck()
+                let failures = results.filter { !$0.ok }
+                await MainActor.run {
                     self.updateLock = false
-                    callback(.success("\(version)（\(cleanupNote)）"))
+                    if failures.isEmpty {
+                        callback(.success("\(installed)（\(cleanupNote)）· 自检 3/3 通过"))
+                    } else {
+                        callback(.failure(SelfCheckFailure(results: results)))
+                    }
                 }
             } catch {
                 // 任一步失败：不碰服务器（继续旧的），只回传错误
                 await MainActor.run {
                     self.updateLock = false
                     onUpdateProgress?("✗ 更新失败：\(error.localizedDescription)")
+                    callback(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// 等后端对任意 HTTP 请求产生响应（200/401/403 都算"已监听"）。
+    /// nonisolated：纯 URLSession 轮询，不触隔离状态。
+    nonisolated private static func waitBackendResponding(timeout: TimeInterval) async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:3080/") else { return false }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 3
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            if let (_, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse, (200...599).contains(http.statusCode) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
+    }
+
+    /// 自检失败后的一键回滚：恢复快照 → 杀后端 → 清解析缓存 → 冷启动旧版本。
+    /// 回调返回恢复到的版本号；任何失败原样抛给 UI 展示。
+    func rollbackFromFailedUpdate(_ callback: @escaping @MainActor (Result<String, Error>) -> Void) {
+        guard !updateLock else { return }
+        updateLock = true
+        onUpdateProgress?("── 开始回滚到更新前版本 ──")
+        Task {
+            do {
+                let restored = try await UpdateSafety.rollback()
+                await UpdateSafety.killBackendForRollback()
+                await MainActor.run {
+                    UserDefaults.standard.removeObject(forKey: "resolvedServerCommand")
+                    UserDefaults.standard.removeObject(forKey: "resolvedServerCommandSource")
+                    if self.serverProcess != nil { self.stopAndWait() }
+                    self.status = .stopped
+                    self.forwardStart()
+                    self.updateLock = false
+                    self.onUpdateProgress?("✓ 已回滚至 v\(restored) 并重启后端")
+                    callback(.success(restored))
+                }
+            } catch {
+                await MainActor.run {
+                    self.updateLock = false
+                    self.onUpdateProgress?("✗ 回滚失败：\(error.localizedDescription)")
                     callback(.failure(error))
                 }
             }
