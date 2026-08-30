@@ -579,8 +579,14 @@ final class ServerManager: ObservableObject {
                 cleanupNote = cleanupResult
                 onUpdateProgress?("✓ 清理完成：\(cleanupNote)")
                 // ④ 停服 → 清解析缓存 → 冷启动（新版本接管端口）
+                // 【实测修正】attach 模式：后端是外部实例时 stopAndWait 够不着 →
+                // 必须显式杀 3080 监听者，否则新版起不来、自检探到旧版假通过
+                if self.serverProcess != nil {
+                    await MainActor.run { self.stopAndWait() }
+                } else {
+                    await UpdateSafety.killBackendForRollback()
+                }
                 await MainActor.run {
-                    if self.serverProcess != nil { self.stopAndWait() }
                     UserDefaults.standard.removeObject(forKey: "resolvedServerCommand")
                     UserDefaults.standard.removeObject(forKey: "resolvedServerCommandSource")
                     self.status = .stopped
@@ -591,7 +597,22 @@ final class ServerManager: ObservableObject {
                 onUpdateProgress?(backendUp
                     ? "✓ 新后端已监听，开始兼容性自检…"
                     : "! 后端 30s 内未响应，仍执行自检记录现状…")
-                let results = await UpdateSafety.selfCheck()
+                var results = await UpdateSafety.selfCheck()
+                if results.allSatisfy(\.ok) {
+                    // 稳定性复探：自检瞬间存活≠稳定；3s 后桥接再探，崩了按失败处理
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    var stable = false
+                    if let url = URL(string: "http://127.0.0.1:3080/api/desktop/status") {
+                        var req = URLRequest(url: url); req.timeoutInterval = 5
+                        req.cachePolicy = .reloadIgnoringLocalCacheData
+                        if let (_, resp) = try? await URLSession.shared.data(for: req),
+                           (resp as? HTTPURLResponse)?.statusCode == 200 { stable = true }
+                    }
+                    if !stable {
+                        results.append(CheckResult(id: "稳定性复探", name: "稳定性复探", ok: false,
+                            detail: "自检通过 3 秒后桥接不可达（后端疑似启动后退出）"))
+                    }
+                }
                 let failures = results.filter { !$0.ok }
                 await MainActor.run {
                     self.updateLock = false

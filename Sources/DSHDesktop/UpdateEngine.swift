@@ -386,6 +386,18 @@ enum UpdateSafety {
         for dir in manifest.installedNewDirs {
             try? fm.removeItem(at: npxRoot.appendingPathComponent(dir))
         }
+        // ①' 清除版本不符的残留目录：回滚语义=回到快照版本。若残留目录携带其他版本
+        // （如缓存命中的 alpha 目录未进差集），解析器可能按 mtime 优先命中它 → 回滚失效
+        if let entries = try? fm.contentsOfDirectory(atPath: npxRoot.path) {
+            for entry in entries {
+                let pkg = npxRoot.appendingPathComponent(entry)
+                    .appendingPathComponent("node_modules/@deepseek-ai/dsh/package.json")
+                guard let data = try? Data(contentsOf: pkg),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let v = obj["version"] as? String, v != manifest.version else { continue }
+                try? fm.removeItem(at: npxRoot.appendingPathComponent(entry))
+            }
+        }
         // ② 恢复快照到原位（原目录可能被安装流程清理过，先确保父目录存在）
         let dest = URL(fileURLWithPath: manifest.sourcePath)
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
