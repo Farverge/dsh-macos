@@ -12,17 +12,14 @@ struct SettingsView: View {
     @State private var isUpdatingDSH = false
     @State private var isCheckingApp = false
     @State private var pendingLatest: String?
-    @State private var showUpdateConfirm = false
     @State private var updateLog: [String] = []
     @State private var showUpdateLog = false
     // v1.0.1：alpha 通道与自检回滚
     @State private var pendingAlpha: String?
-    @State private var showAlphaConfirm = false
     @State private var selfCheckFailures: [CheckResult]?
     @State private var showRollbackConfirm = false
     // 应用自更新（v1.0.1）：确认弹窗 + 执行态
     @State private var pendingAppRelease: AppSelfUpdater.Release?
-    @State private var showAppUpdateConfirm = false
     @State private var isUpdatingApp = false
     // 菜单栏插件管理（轻量：仅打开设置/点刷新时读一次，无后台任务）
     @State private var pluginRunning = false
@@ -151,18 +148,10 @@ struct SettingsView: View {
                         }
                         pendingAppRelease = release
                         updateMessage = "发现新版本 \(release.tag)（当前 v\(appVersion)）。"
-                        showAppUpdateConfirm = true
+                        presentAppUpdateConfirm(release)
                     }
                 }
                 .disabled(isCheckingApp || isUpdatingApp)
-                .alert("更新应用", isPresented: $showAppUpdateConfirm, presenting: pendingAppRelease) { release in
-                    Button("下载并自动更新重启", role: .destructive) {
-                        performAppSelfUpdate(release)
-                    }
-                    Button("取消", role: .cancel) {}
-                } message: { release in
-                    Text("将下载 DSH.MacOS.Desktop.zip（v\(release.version)），校验通过后自动替换并重启。\n旧版本会备份到 ~/Library/Application Support/DSH Backups/ 以便回退。")
-                }
             }
         }
         .formStyle(.grouped)
@@ -183,7 +172,7 @@ struct SettingsView: View {
     private var dshUpdateControls: some View {
         updateStatusArea
         updateCheckButton
-        if let alpha = pendingAlpha, !showUpdateConfirm {
+        if let alpha = pendingAlpha {
             alphaInstallButton(alpha)
         }
     }
@@ -218,7 +207,7 @@ struct SettingsView: View {
         }
     }
 
-    /// 检查按钮（rc 稳定版确认弹窗挂在此处）
+    /// 检查按钮（rc 稳定版确认改走独立窗：handleCheckResult 命中后调 presentBackendUpdateConfirm）
     private var updateCheckButton: some View {
         Button(isUpdatingDSH ? "更新中…" : "检查 DSH 更新（联网拉最新版）") {
             guard !isUpdatingDSH else { return }
@@ -230,30 +219,16 @@ struct SettingsView: View {
         }
         .disabled(isUpdatingDSH)
         .background(rollbackAlertAnchor)   // 回滚弹窗锚点改挂背景（独立 Form 行曾渲染成空行）
-        .alert("发现新版本", isPresented: $showUpdateConfirm, presenting: pendingLatest) { latest in
-            Button("现在更新并重启") {
-                startUpdate(distTag: "latest", version: latest)
-            }
-            Button("取消", role: .cancel) {}
-        } message: { latest in
-            Text("是否下载 dsh \(latest) 并自动重启后端？（稳定版通道）\n\n下载在后台独立进程进行——即使关闭应用，下载进程也不会中断，会继续完成。")
-        }
     }
 
-    /// alpha 安装按钮（独立确认弹窗，警示样式）
+    /// alpha 安装按钮（v1.0.2：确认改走独立窗，警示文案移入窗顶红字一行）
     private func alphaInstallButton(_ alpha: String) -> some View {
         Button("安装预发布版 \(alpha)…") {
-            showAlphaConfirm = true
+            presentBackendUpdateConfirm(
+                from: server.currentDSHVersion ?? "",
+                to: alpha, prerelease: true)
         }
         .disabled(isUpdatingDSH)
-        .alert("安装预发布版？", isPresented: $showAlphaConfirm) {
-            Button("仍要安装", role: .destructive) {
-                startUpdate(distTag: "alpha", version: alpha)
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("预发布版本可能不稳定，生产环境请使用稳定版。\n\n已知影响（\(alpha)）：\n· 浏览器认证链启用——旧版壳可能出现页面 401\n\n安装后将自动运行兼容性自检；未通过可一键回滚到当前版本。")
-        }
     }
 
     /// 回滚弹窗（锚定在隐藏视图上，与其它弹窗互不嵌套）
@@ -287,7 +262,7 @@ struct SettingsView: View {
             } else if let stable = availability.stable {
                 pendingLatest = stable
                 updateMessage = "发现新版本 \(stable)（当前 \(current.isEmpty ? "未解析" : current)，稳定版通道）。确认后才会更新重启。"
-                showUpdateConfirm = true
+                presentBackendUpdateConfirm(from: current, to: stable, prerelease: false)
             }
             if let alpha = availability.alpha,
                current.isEmpty || SemVer.compare(current, alpha) < 0 {
@@ -296,6 +271,54 @@ struct SettingsView: View {
             }
         case .failure(let e):
             updateMessage = "检查失败：\(e.localizedDescription)"
+        }
+    }
+
+    // MARK: - 更新确认独立窗接线（v1.0.2）
+    // 三条更新链路的执行逻辑（startUpdate / applyDSHUpdate / performAppSelfUpdate）
+    // 原样复用，这里只换"确认壳"：开窗 → 并行预取 notes → 到达后刷新窗内文本
+    // （预取未就绪先显示"加载中…"，失败静默降级为"官方未提供"）。
+
+    /// 后端确认窗（rc 稳定版 / alpha 预发布共用）：确认回调才触发原更新管线
+    private func presentBackendUpdateConfirm(from current: String, to latest: String, prerelease: Bool) {
+        let token = UpdateConfirmWindowController.shared.show(
+            config: .init(
+                title: prerelease ? "更新 DSH Desktop 后端（预发布）" : "更新 DSH Desktop 后端",
+                fromVersion: current,
+                toVersion: latest,
+                warning: prerelease
+                    ? "预发布版本可能不稳定，生产环境请使用稳定版；已知影响：浏览器认证链启用——旧版壳可能出现页面 401"
+                    : nil,
+                footnote: prerelease
+                    ? "安装后将自动运行兼容性自检；未通过可一键回滚到当前版本。"
+                    : "下载在后台独立进程进行——即使关闭应用，下载进程也不会中断，会继续完成。",
+                confirmTitle: prerelease ? "仍要安装" : "立即更新"),
+            notes: nil) {
+            startUpdate(distTag: prerelease ? "alpha" : "latest", version: latest)
+        }
+        prefetchNotes(repo: UpdateNotesEngine.dshUpstream, from: current, to: latest, token: token)
+    }
+
+    /// 前端应用确认窗
+    private func presentAppUpdateConfirm(_ release: AppSelfUpdater.Release) {
+        let token = UpdateConfirmWindowController.shared.show(
+            config: .init(
+                title: "更新 DSH Desktop 应用",
+                fromVersion: appVersion,
+                toVersion: release.version,
+                footnote: "将下载 DSH.MacOS.Desktop.zip（v\(release.version)），校验通过后自动替换并重启。\n旧版本会备份到 ~/Library/Application Support/DSH Backups/ 以便回退。",
+                confirmTitle: "下载并自动更新重启"),
+            notes: nil) {
+            performAppSelfUpdate(release)
+        }
+        prefetchNotes(repo: UpdateNotesEngine.appRepo, from: appVersion, to: release.version, token: token)
+    }
+
+    /// notes 并行预取：不阻塞开窗；任何网络/解析失败都降级为"官方未提供"，绝不阻断更新
+    private func prefetchNotes(repo: String, from: String, to: String, token: Int) {
+        Task { @MainActor in
+            let notes = await UpdateNotesEngine.fetch(repo: repo, from: from, to: to)
+            UpdateConfirmWindowController.shared.updateNotes(token: token, notes)
         }
     }
 
@@ -444,12 +467,34 @@ func checkLauncherUpdate(currentVersion: String, _ completion: @escaping (String
             case 0:
                 completion("Launcher 已是最新版本：\(currentVersion)")
             case -1:
-                completion("发现新版 \(newestTag)（当前 \(currentVersion)）。请前往 https://github.com/Farverge/DSH-Launcher/releases 下载更新。")
+                presentLauncherUpdateConfirm(from: currentVersion, to: newest)
+                completion("发现新版 \(newestTag)（当前 \(currentVersion)），更新说明见弹窗。")
             default:
                 completion("当前 \(currentVersion) 比远端 \(newestTag) 更新（可能是预发布或本地构建），无需更新。")
             }
         }
     }.resume()
+}
+
+/// Launcher 新版确认窗（卡3 续：本轮不做自动安装——确认按钮只跳转 Releases 页，
+/// 窗尾保留下载指引文本；notes 预取自 Farverge/DSH-Launcher）
+private func presentLauncherUpdateConfirm(from current: String, to newest: String) {
+    let token = UpdateConfirmWindowController.shared.show(
+        config: .init(
+            title: "更新 DSH Launcher",
+            fromVersion: current,
+            toVersion: newest,
+            footnote: "请前往 https://github.com/Farverge/DSH-Launcher/releases 下载更新。",
+            confirmTitle: "前往 GitHub 下载"),
+        notes: nil) {
+        NSWorkspace.shared.open(
+            URL(string: "https://github.com/Farverge/DSH-Launcher/releases")!)
+    }
+    Task { @MainActor in
+        let notes = await UpdateNotesEngine.fetch(
+            repo: UpdateNotesEngine.launcherRepo, from: current, to: newest)
+        UpdateConfirmWindowController.shared.updateNotes(token: token, notes)
+    }
 }
 
 /// 语义化版本分段比较：逐段按数字比较（1.0.10 > 1.0.9）；带 -rc/-beta 等
