@@ -84,12 +84,27 @@ struct DSHDesktopApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    /// SIGTERM/SIGINT/SIGHUP → NSApp.terminate 的信号源（必须持有防释放）
+    private var signalSources: [DispatchSourceSignal] = []
     private var dragStrip: DragStripView?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 从终端直接运行二进制时也需要常规 Dock 应用行为
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        // 【真机实测的孤儿后端 bug】killall / kill <pid> / 注销等 SIGTERM 类退出
+        // 不走 applicationWillTerminate，自 spawn 的后端会变成孤儿 node（实测
+        // 存活并继续占端口）。把 SIGTERM/SIGINT/SIGHUP 引导回 NSApp.terminate，
+        // 让既有停服清理生效；SIGKILL 无法捕获，但那类场景下次启动的 attach
+        // 机制会把残留实例当外部后端接管，属良性降级。DispatchSource 必须被
+        // 持有，否则事件源立即释放失效。
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { NSApp.terminate(nil) }
+            src.resume()
+            signalSources.append(src)
+        }
         // 原生通知：应用在前台时也显示横幅
         UNUserNotificationCenter.current().delegate = self
         // 预请求通知授权：macOS 只在 App 调用过 requestAuthorization 后，
