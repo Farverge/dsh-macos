@@ -507,3 +507,134 @@ enum UpdateSafety {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+// MARK: - 前端应用自更新（v1.0.1）
+
+/// 应用自身更新：GitHub Release 查询（防降级）→ 下载校验 → 暂存换壳 → 分离脚本换入并重启。
+/// 与后端更新同一安全哲学：任一步失败不动现有安装；换壳动作由脱离本进程的脚本完成
+/// （应用不能可靠地替换正在运行的自身）。
+enum AppSelfUpdater {
+    struct Release {
+        let tag: String            // 形如 v1.0.1
+        let version: String        // 去掉 v 前缀
+        let zipURL: URL?           // 稳定名资产 DSH.MacOS.Desktop.zip
+    }
+
+    static func fetchLatestRelease() async -> Release? {
+        guard let url = URL(string: "https://api.github.com/repos/Farverge/DSH-MacOS/releases/latest") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("DSH-Desktop-Updater", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = obj["tag_name"] as? String else { return nil }
+            let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            var zipURL: URL?
+            if let assets = obj["assets"] as? [[String: Any]] {
+                zipURL = assets.compactMap { asset -> URL? in
+                    guard let name = asset["name"] as? String, name == "DSH.MacOS.Desktop.zip",
+                          let link = asset["browser_download_url"] as? String else { return nil }
+                    return URL(string: link)
+                }.first
+            }
+            return Release(tag: tag, version: version, zipURL: zipURL)
+        } catch {
+            return nil
+        }
+    }
+
+    /// 下载 zip → 解包校验（.app 结构 + Info.plist 版本与 Release 一致）。
+    /// 返回解包出的 .app 目录；任何不符抛错且不触碰 /Applications。
+    static func downloadAndVerify(release: Release,
+                                  progress: @escaping (String) -> Void) async throws -> URL {
+        guard let zipURL = release.zipURL else {
+            throw NSError(domain: "appupdate", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Release 缺少 DSH.MacOS.Desktop.zip 资产"])
+        }
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dshapp-\(UUID().uuidString.prefix(8))")
+        let zip = tmp.appendingPathExtension("zip")
+        progress("→ \(zipURL.lastPathComponent)")
+        let (data, response) = try await URLSession.shared.data(from: zipURL)
+        guard (response as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty else {
+            throw NSError(domain: "appupdate", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)）"])
+        }
+        try data.write(to: zip)
+        progress("✓ 下载完成（\(data.count / 1024)KB）")
+
+        // 解包与结构校验放后台线程
+        let unpacked = try await Task.detached(priority: .userInitiated) { () -> URL in
+            let fm = FileManager.default
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            proc.arguments = ["-x", "-k", zip.path, tmp.path]   // ditto 解 zip 保权限
+            try proc.run(); proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else {
+                throw NSError(domain: "appupdate", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "zip 解包失败"])
+            }
+            let app = tmp.appendingPathComponent("DSH Desktop.app")
+            let plist = app.appendingPathComponent("Contents/Info.plist")
+            guard fm.fileExists(atPath: plist.path),
+                  fm.fileExists(atPath: app.appendingPathComponent("Contents/MacOS/DSHDesktop").path),
+                  let info = NSDictionary(contentsOf: plist),
+                  let v = info["CFBundleShortVersionString"] as? String else {
+                throw NSError(domain: "appupdate", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "包结构异常（缺 .app/Info.plist/可执行文件）"])
+            }
+            guard v == release.version else {
+                throw NSError(domain: "appupdate", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "包内版本 \(v) 与 Release \(release.version) 不符，拒装"])
+            }
+            return app
+        }.value
+        progress("✓ 校验通过：DSH Desktop.app v\(release.version)")
+        return unpacked
+    }
+
+    /// 换壳三部曲：新包暂存入 /Applications → 旧包移入备份区 → 分离脚本完成换入并重启。
+    /// 本进程在脚本派生后立即退出（脚本 sleep 1 等本进程退干净）。
+    static func swapAndRelaunch(newApp: URL,
+                                progress: @escaping (String) -> Void) throws {
+        let fm = FileManager.default
+        let dest = URL(fileURLWithPath: "/Applications/DSH Desktop.app")
+        let staging = URL(fileURLWithPath: "/Applications/DSH Desktop.app.new")
+        let backups = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/DSH Backups")
+        try? fm.removeItem(at: staging)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = [newApp.path, staging.path]
+        try ditto.run(); ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            throw NSError(domain: "appupdate", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "暂存拷贝失败"])
+        }
+        try fm.createDirectory(at: backups, withIntermediateDirectories: true)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let script = """
+        #!/bin/bash
+        sleep 1
+        mv '/Applications/DSH Desktop.app' '\(backups.path)/DSH Desktop.app.bak-\(stamp)' 2>/dev/null
+        mv '/Applications/DSH Desktop.app.new' '/Applications/DSH Desktop.app' || { mv '\(backups.path)/DSH Desktop.app.bak-\(stamp)' '/Applications/DSH Desktop.app'; exit 1; }
+        open '/Applications/DSH Desktop.app'
+        """
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsh-swap-\(UUID().uuidString.prefix(6)).sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        // 分离执行：nohup 让脚本脱离本进程生命周期；应用随后退出
+        let runner = Process()
+        runner.executableURL = URL(fileURLWithPath: "/bin/bash")
+        runner.arguments = [scriptURL.path]
+        runner.qualityOfService = .userInitiated
+        try runner.run()
+        progress("✓ 换壳脚本已派生，应用即将退出并由新版接管")
+    }
+}
