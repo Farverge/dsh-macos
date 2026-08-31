@@ -157,7 +157,6 @@ struct SettingsView: View {
         if let alpha = pendingAlpha, !showUpdateConfirm {
             alphaInstallButton(alpha)
         }
-        rollbackAlertAnchor
     }
 
     /// 进度文案 + 终端风格日志
@@ -201,6 +200,7 @@ struct SettingsView: View {
             }
         }
         .disabled(isUpdatingDSH)
+        .background(rollbackAlertAnchor)   // 回滚弹窗锚点改挂背景（独立 Form 行曾渲染成空行）
         .alert("发现新版本", isPresented: $showUpdateConfirm, presenting: pendingLatest) { latest in
             Button("现在更新并重启") {
                 startUpdate(distTag: "latest", version: latest)
