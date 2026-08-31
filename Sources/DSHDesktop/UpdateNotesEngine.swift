@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - 更新说明（Release Notes）拉取与清洗
 //
-// 更新确认弹窗的数据源：GitHub Release body → 纯文本，按版本升序聚合多版本。
+// 更新确认弹窗的数据源：GitHub Release body → 纯文本，按版本降序聚合多版本（新版在上）。
 // 设计铁律：notes 只是锦上添花——任何网络/解析失败一律回空，绝不 throw 到
 // 调用方，与更新主流程（下载/安装/回滚）零耦合。npm dist-tags 无 changelog，
 // 后端 notes 一律走 GitHub releases（tag→release 映射）。
@@ -21,8 +21,8 @@ enum UpdateNotesEngine {
     static let appRepo = "Farverge/DSH-MacOS"                 // 前端应用自身
     static let launcherRepo = "Farverge/DSH-Launcher"         // 菜单栏伴侣应用
 
-    /// 聚合 (from, to] 区间的所有 release notes，按版本**升序**返回
-    /// （升级叙事从近到远：先看最接近当前版的变更，最后看目标版）。
+    /// 聚合 (from, to] 区间的所有 release notes，按版本**降序**返回
+    /// （新版在上：用户最关心的是目标版改了什么，旧版变更往下看）。
     /// 任何失败 → []，调用方据此显示"官方未提供本次更新说明"。
     static func fetch(repo: String, from: String, to: String) async -> [ReleaseNotes] {
         // 列表端点每页含 tag_name/name/body；dsh 发版节奏下 20 条足以覆盖任意跨度
@@ -37,7 +37,7 @@ enum UpdateNotesEngine {
         // （alpha.1 < alpha.2 恰为字典序，跨主版本号仍由 SemVer 主导）
         return hit.sorted {
             let c = SemVer.compare($0.version, $1.version)
-            return c == 0 ? $0.version < $1.version : c < 0
+            return c == 0 ? $0.version > $1.version : c > 0
         }
     }
 

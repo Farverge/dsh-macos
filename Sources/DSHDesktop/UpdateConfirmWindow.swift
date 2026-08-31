@@ -129,26 +129,23 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         win.contentView = content
 
         // —— 版本跨度行（v本地 → v最新（跨 N 个版本））——
-        let versionField = NSTextField(labelWithString: "")
+        let versionField = NSTextField(wrappingLabelWithString: "")
         versionField.font = .systemFont(ofSize: 13, weight: .semibold)
-        versionField.alignment = .natural          // 左对齐（LTR 下即靠左）
-        versionField.lineBreakMode = .byWordWrapping
+        versionField.alignment = .center         // 三行头信息统一居中（用户定稿版式）
         self.versionField = versionField
 
         // —— 顶部红字警示：只放一句话结论（仅 alpha 通道填文案）——
-        let warningField = NSTextField(labelWithString: "")
+        let warningField = NSTextField(wrappingLabelWithString: "")
         warningField.font = .systemFont(ofSize: 12, weight: .medium)
         warningField.textColor = .systemRed
-        warningField.alignment = .natural
-        warningField.lineBreakMode = .byWordWrapping
+        warningField.alignment = .center
         self.warningField = warningField
 
         // —— 橙字补充：红字的细节展开（影响面 / 回滚手段），与红字各占一行 ——
-        let warningDetailField = NSTextField(labelWithString: "")
+        let warningDetailField = NSTextField(wrappingLabelWithString: "")
         warningDetailField.font = .systemFont(ofSize: 12)
         warningDetailField.textColor = .systemOrange
-        warningDetailField.alignment = .natural
-        warningDetailField.lineBreakMode = .byWordWrapping
+        warningDetailField.alignment = .center
         self.warningDetailField = warningDetailField
 
         // —— notes 只读滚动区 ——
@@ -183,11 +180,9 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         scroll.documentView = textView
 
         // —— 底部灰字说明（备份策略 / Launcher 下载指引）——
-        let footnoteField = NSTextField(labelWithString: "")
+        let footnoteField = NSTextField(wrappingLabelWithString: "")
         footnoteField.font = .systemFont(ofSize: 11)
         footnoteField.textColor = .secondaryLabelColor
-        footnoteField.alignment = .natural
-        footnoteField.lineBreakMode = .byWordWrapping
         self.footnoteField = footnoteField
 
         // —— 底部按钮：右侧 [取消] [立即更新]，ESC 挂在取消键上（原生等价键惯例）——
@@ -206,11 +201,14 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
 
         // 纵向栈：隐藏的警示/补充/说明行会被自动收起，无需手工挪布局。
         // alignment 用 .width 让各行随窗口等宽拉伸（正文与警示需要整行宽度换行）；
-        // 各文本字段自身 alignment 已钉在 .natural，视觉上一律左起，不再混排。
+        // 【陷阱】distribution 默认按"重力区"分布——窗口拉高时多余高度会变成行间
+        // 空白而不是给滚动区（真机实测：说明区与按钮之间出现大片空隙、滚动区
+        // 不随窗口伸缩）。显式 .fill + 滚动区低 hugging，增减高度全部由它吸收。
         let stack = NSStackView(views: [versionField, warningField, warningDetailField,
                                         scroll, footnoteField, buttonRow])
         stack.orientation = .vertical
         stack.alignment = .width
+        stack.distribution = .fill
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -246,7 +244,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))   // 新内容从顶部看起
     }
 
-    /// notes 三态：预取中 / 官方未提供 / 分节正文（每版一节 `── vX.Y.Z ──`）。
+    /// notes 三态：预取中 / 官方未提供 / 分节正文（每版一节 `── vX.Y.Z ──`，
+    /// 数组本身已按版本降序传入——新版在上，往下看历史）。
     /// 中文说明是散文体：正文用比例字体 systemFont 13（等宽 Menlo 的英文等宽
     /// 间隔落在中文上观感稀疏，且与 GitHub 网页的阅读排版不符），行距 3 补足
     /// 中文方块的呼吸感；分节头同字号 semibold 区分层级。
