@@ -616,6 +616,8 @@ enum AppSelfUpdater {
             throw NSError(domain: "appupdate", code: 5,
                 userInfo: [NSLocalizedDescriptionKey: "暂存拷贝失败"])
         }
+        // 暂存已完整，下载/解包的临时目录可清（/tmp 系统兜底，此处主动收尾）
+        try? fm.removeItem(at: newApp.deletingLastPathComponent())
         try fm.createDirectory(at: backups, withIntermediateDirectories: true)
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")

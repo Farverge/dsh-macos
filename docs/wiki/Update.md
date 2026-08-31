@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 ```
 
 - 或到 [Releases](https://github.com/Farverge/DSH-MacOS/releases) 手动下载 `DSH.MacOS.Desktop.zip`
-- 应用内「检查应用更新」读取 GitHub Releases 最新 tag 与本地版本比对，只提示不自动安装；需仓库已有 Release
+- 应用内「检查应用更新」读取 GitHub Releases 最新 tag，语义化比较（远端较旧视为最新，防降级误报）；发现新版确认后自动下载 DSH.MacOS.Desktop.zip → 结构与版本校验 → 暂存换壳 → 自动重启，旧版备份到 `~/Library/Application Support/DSH Backups/`
 
 ### 权限说明
 
