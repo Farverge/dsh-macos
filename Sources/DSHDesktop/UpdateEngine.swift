@@ -1,4 +1,5 @@
 import Foundation
+import WebKit
 
 // MARK: - 数据结构
 
@@ -340,8 +341,33 @@ enum UpdateSafety {
         return results
     }
 
+    /// 从 WKWebView 共享 Cookie 库借出 dsh 认证 Cookie（dsh-auth- 前缀），
+    /// 拼成 Cookie 头返回；无认证 Cookie 返回 nil。WKHTTPCookieStore 回调在主线程。
+    private static func dshAuthCookieHeader() async -> String? {
+        // 认证 Cookie 是 HttpOnly 的（JS 与 URLSession 都读不到），只存在
+        // WKWebsiteDataStore.default 的共享库里——壳的 WebView 首载 token URL
+        // 后由后端 Set-Cookie 写入，30 天有效。探针想以"浏览器会话"的身份
+        // 验证新版，只能从这里借。
+        let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                continuation.resume(returning: cookies)
+            }
+        }
+        // 只借 dsh 认证链的签名 Cookie，且域须为本机后端；其余 Cookie 不掺和，
+        // 避免把无关身份错当会话凭证
+        let auth = cookies.filter {
+            $0.name.hasPrefix("dsh-auth-") && $0.domain.contains("127.0.0.1")
+        }
+        guard !auth.isEmpty else { return nil }
+        return auth.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+
+    /// 探针通用执行：发请求 → 若 401 自动借 WKWebView 会话 Cookie 重试一次 →
+    /// 把（重试后的）状态码与 JSON 交给 validate 裁决。第三参 retriedWithCookie
+    /// 标记"结果是否来自带 Cookie 的重试"，供各探针区分"无认证直接 200（旧版）"
+    /// 与"认证链放行了浏览器会话（新版+壳已授权）"两种 ok 文案。
     private static func probe(_ path: String, name: String,
-                              validate: @escaping ([String: Any], Int) -> CheckResult) async -> CheckResult {
+                              validate: @escaping ([String: Any], Int, Bool) -> CheckResult) async -> CheckResult {
         guard let url = URL(string: "http://127.0.0.1:3080\(path)") else {
             return CheckResult(id: name, name: name, ok: false, detail: "URL 构造失败")
         }
@@ -349,21 +375,54 @@ enum UpdateSafety {
         request.timeoutInterval = 10
         request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let obj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-            return validate(obj, code)
+            var (data, response) = try await URLSession.shared.data(for: request)
+            // 【真机实测的启动窗口】0.1.2-alpha.2 刚监听时有一段"路由未就绪"
+            // 期：根路径先返回 404，稳态才变为 401/200——自检恰在窗口内执行
+            // 就会把健康后端误判成"根页面 404"触发回滚弹窗。404 时最多再等
+            // 8s 复探（新版根路径稳态不会是 404，等待安全；仅根路径如此）。
+            let steadyDeadline = Date().addingTimeInterval(8)
+            while path == "/",
+                  (response as? HTTPURLResponse)?.statusCode == 404,
+                  Date() < steadyDeadline {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                (data, response) = try await URLSession.shared.data(for: request)
+            }
+            var code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            var obj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            var retriedWithCookie = false
+            // 0.1.2-alpha.1+ 的认证链让未签名请求一律 401，而 URLSession 不共享
+            // WKWebView 的 Cookie——直接判 fail 会把"对浏览器会话完全正常"的新版
+            // 误杀回滚。所以借壳的会话 Cookie 重试一次：能借到且重试恢复预期响应，
+            // 说明新版只是加了认证而非坏了。无 Cookie 可借或重试仍 401 时 code
+            // 停留在 401，validate 按"无 Cookie"分支处理（各探针 401 文案已覆盖）。
+            if code == 401, let cookieHeader = await dshAuthCookieHeader() {
+                request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+                let (retryData, retryResponse) = try await URLSession.shared.data(for: request)
+                code = (retryResponse as? HTTPURLResponse)?.statusCode ?? 0
+                obj = (try? JSONSerialization.jsonObject(with: retryData) as? [String: Any]) ?? [:]
+                retriedWithCookie = true
+            }
+            return validate(obj, code, retriedWithCookie)
         } catch {
             return CheckResult(id: name, name: name, ok: false, detail: "不可达：\(error.localizedDescription)")
         }
     }
 
     private static func probeRoot() async -> CheckResult {
-        await probe("/", name: "根页面") { _, code in
+        await probe("/", name: "根页面") { _, code, retriedWithCookie in
             switch code {
             case 200:
-                return CheckResult(id: "根页面", name: "根页面", ok: true, detail: "HTTP 200")
-            case 401, 403:
+                // 直接 200 = 旧版未启用认证链；借 Cookie 重试后 200 = 认证链
+                // 已启用且对壳会话放行
+                return CheckResult(id: "根页面", name: "根页面", ok: true,
+                    detail: retriedWithCookie ? "认证链已启用，壳会话 Cookie 有效" : "HTTP 200")
+            case 401:
+                // 走到这说明无 Cookie 可借或带 Cookie 仍 401。根页面是用户可见的
+                // 第一屏，壳自己都过不了认证 = 新版对当前壳不可用，此处必须 fail
+                //（API 探针可宽容，根页面不行），并指明完成授权的途径。
+                return CheckResult(id: "根页面", name: "根页面", ok: false,
+                    detail: "HTTP 401：新版认证链已启用但壳尚未完成授权（等待 WebView 首载 token URL；若为外部 attach 实例，其 token 打印在启动它的终端里）")
+            case 403:
                 return CheckResult(id: "根页面", name: "根页面", ok: false,
                     detail: "HTTP \(code)：新版启用了浏览器认证（launch token + Cookie），当前壳尚未适配该流程")
             default:
@@ -373,9 +432,19 @@ enum UpdateSafety {
     }
 
     private static func probeBridge() async -> CheckResult {
-        await probe("/api/desktop/status", name: "桥接状态") { obj, code in
+        await probe("/api/desktop/status", name: "桥接状态") { obj, code, retriedWithCookie in
             if code == 200, obj["ok"] as? Bool == true {
-                return CheckResult(id: "桥接状态", name: "桥接状态", ok: true, detail: "ok")
+                // 直接 200 = 旧版；借 Cookie 后 200 = 认证链保护 API 且壳会话
+                // 验证通过
+                return CheckResult(id: "桥接状态", name: "桥接状态", ok: true,
+                    detail: retriedWithCookie ? "认证链保护 API，带会话 Cookie 验证通过" : "ok")
+            }
+            if code == 401 {
+                // 桥接 API 只在 WebView 会话内被真实调用，壳外探针拿不到会话
+                // 不等于功能坏了——降级为非致命提示而非触发回滚的硬失败，
+                // 以 WebView 内实际功能为准。
+                return CheckResult(id: "桥接状态", name: "桥接状态", ok: false,
+                    detail: "HTTP 401（认证链拦截 API 且无可用会话 Cookie——以 WebView 内实际功能为准）")
             }
             return CheckResult(id: "桥接状态", name: "桥接状态", ok: false,
                 detail: "HTTP \(code)（桥接插件路由未按预期响应）")
@@ -383,9 +452,16 @@ enum UpdateSafety {
     }
 
     private static func probeMini() async -> CheckResult {
-        await probe("/api/mini/options", name: "迷你框插件") { _, code in
+        await probe("/api/mini/options", name: "迷你框插件") { _, code, retriedWithCookie in
             if code == 200 {
-                return CheckResult(id: "迷你框插件", name: "迷你框插件", ok: true, detail: "ok")
+                return CheckResult(id: "迷你框插件", name: "迷你框插件", ok: true,
+                    detail: retriedWithCookie ? "认证链保护 API，带会话 Cookie 验证通过" : "ok")
+            }
+            if code == 401 {
+                // 迷你框路由同样只在 WebView 会话里被真实使用；无 Cookie 的探针
+                // 无法区分"被认证链拦"与"路由坏了"，按非致命降级处理并明示局限
+                return CheckResult(id: "迷你框插件", name: "迷你框插件", ok: false,
+                    detail: "HTTP 401（认证链拦截，无法在无 Cookie 会话中验证插件路由）")
             }
             if code == 404 {
                 return CheckResult(id: "迷你框插件", name: "迷你框插件", ok: false,

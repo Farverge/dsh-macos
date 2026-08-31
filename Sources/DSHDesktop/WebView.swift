@@ -5,6 +5,14 @@ import UserNotifications
 /// 内嵌 DSH Web GUI 的 WKWebView 封装
 struct HarnessWebView: NSViewRepresentable {
     let url: URL
+    /// 一次性授权 URL（优先于 url 首载）。0.1.2-alpha.1+ 的后端在 stdout
+    /// 打印 `dsh web: http://127.0.0.1:port/?token=...`，首载先访问它，
+    /// 服务端 303 回裸 "/" 并 Set-Cookie（HttpOnly），此后 WKWebView
+    /// 自动持有 Cookie；裸 URL 首载只会停在 401 文本页。
+    var authURL: URL? = nil
+    /// 发起授权加载后立即回调（上层清掉 authLaunchURL）：token 一次性，
+    /// 加载一经发起就必须作废，防止重渲染时二次复用
+    var onAuthConsumed: (() -> Void) = {}
     var onLoadState: (LoadState) -> Void = { _ in }
 
     enum LoadState {
@@ -36,16 +44,62 @@ struct HarnessWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        // 认证链（0.1.2-alpha.1+）：**每个新 token** 都要触发一次授权导航——
+        // 不止首载：后端重启换新 token 时 WebView 往往还挂着旧页面（断连
+        // 横幅态，hasLoadedOnce=true），不主动导航它就永远拿不到新会话
+        // Cookie（旧页面的 API 重试会一直 401）。靠"上次已消费的 token
+        // URL"判新：authLaunchURL 每进程只被 ServerManager 发一次、
+        // 消费即清空，非空即代表新 token 到达。
+        if let auth = authURL, context.coordinator.lastAuthURL != auth {
+            // 【真机实测的竞态】后端刚监听时有一段"路由未就绪"窗口（根路径
+            // 返回 404，就绪后才变为 401/200）。token 是一次性的：若在窗口
+            // 期内花掉，303 换 Cookie 的交换会直接失败且本进程再无第二次
+            // 机会（页面停在空白）。故授权加载必须先等根路径进入稳态
+            // （200 或 401+认证文案），才把这张一次性牌打出去。
+            context.coordinator.lastAuthURL = auth
+            context.coordinator.isLoading = true   // 挡住等待期间裸 URL 抢载
+            let bare = url
+            Task { @MainActor [weak webView] in
+                await Self.waitRootSteady(base: bare, timeout: 10)
+                webView?.load(URLRequest(url: auth))
+                // token 一次性：加载已发起，立即回调上层清掉 authLaunchURL。
+                // 随之而来的重渲染会被 lastAuthURL/isLoading 守卫拦住，不会
+                // 补发裸 URL 加载去打断这次授权导航。
+                onAuthConsumed()
+            }
+            return
+        }
         // 只在首次加载时由我们发起；此后 SPA 的路由变化（pushState 等）
         // 会改变 webView.url，不能再按地址差异重载根页面，否则会打断应用。
         // 手动刷新走菜单栏“刷新页面”（reload）。
         guard !context.coordinator.hasLoadedOnce else { return }
         guard !context.coordinator.isLoading else { return }
-        if webView.url?.absoluteString != url.absoluteString {
+        let target = url
+        if webView.url?.absoluteString != target.absoluteString {
             // 同步置位 isLoading，避免 didStartProvisional 异步到达前
             // 被另一次 updateNSView 重复发起加载
             context.coordinator.isLoading = true
-            webView.load(URLRequest(url: url))
+            webView.load(URLRequest(url: target))
+        }
+    }
+
+    /// 等根路径进入稳态：HTTP 200（旧版无认证）或 401 且 body 含 dsh 认证
+    /// 文案（新版认证链就绪）。超时后放行（尽力而为，不再无限等）。
+    /// nonisolated：纯 URLSession 轮询。
+    nonisolated private static func waitRootSteady(base: URL, timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var request = URLRequest(url: base)
+            request.timeoutInterval = 2
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            if let (data, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse {
+                if http.statusCode == 200 { return }
+                if http.statusCode == 401,
+                   String(decoding: data, as: UTF8.self)
+                       .contains("dsh web authentication required") { return }
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
     }
 
@@ -56,6 +110,9 @@ struct HarnessWebView: NSViewRepresentable {
         private var enhancementsObserver: NSObjectProtocol?
         var isLoading = false
         private(set) var hasLoadedOnce = false
+        /// 最近一次已消费的授权 token URL：非空且与新到的 authLaunchURL 不同
+        /// = 新进程的新 token 到达，需要再做一次授权导航（含断连重连场景）
+        var lastAuthURL: URL?
 
         init(_ parent: HarnessWebView) {
             self.parent = parent

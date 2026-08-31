@@ -98,6 +98,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
         }
 
+        // 认证链装配（0.1.2-alpha.1+）：ServerManager 从后端 stdout 捕获到
+        // 带 token 的完整 launch URL（每进程仅一次）时推给 AppState，
+        // 供 HarnessWebView 首载完成一次性授权换 Cookie。旧版后端
+        // （0.1.1-rc.2）没有 token 行，回调不触发，首载仍走裸 URL。
+        ServerManager.shared.onLaunchTokenURL = { url in
+            AppState.shared.authLaunchURL = url
+        }
+
         // 沉浸式窗口：等主窗口出现后设置透明标题栏 + 内容延伸（红绿灯悬浮、内容顶到顶）。
         // 受「沉浸式标题栏」开关控制（默认开，关闭后回到系统标准标题栏）。
         applyWindowEnhancements()

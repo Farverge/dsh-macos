@@ -22,6 +22,9 @@ final class ServerManager: ObservableObject {
     var isUpdating: Bool { updateLock }
     /// 更新过程中的阶段/明细回调（UI 展示）
     var onUpdateProgress: (@MainActor (String) -> Void)?
+    /// 认证链：从后端 stdout 捕获到的 launch token URL（每进程一次，轮换）。
+    /// 由应用层接线设置（转存 AppState.authLaunchURL 供 WebView 首载授权）。
+    var onLaunchTokenURL: (@MainActor (URL) -> Void)?
     /// 镜像源（国内 CDN，比 registry.npmjs.org 快）
 
     init(appState: AppState) {
@@ -167,15 +170,71 @@ final class ServerManager: ObservableObject {
         }
         process.environment = env
 
-        // 把服务器输出转发到应用 stdout，便于排障
+        // 把服务器输出转发到应用 stdout，便于排障；同时逐行扫描认证链的
+        // launch token 行（dsh web 启动时在 stdout 打印一行带 token 的 URL）。
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         outputPipe = pipe
-        pipe.fileHandleForReading.readabilityHandler = { handle in
+        // readabilityHandler 给到的 data 是“可读即回”的任意切割分片，
+        // `dsh web: ...` 这一行可能被劈成多个 chunk 跨次到达，必须维护
+        // 残余缓冲拼行、只对凑齐换行的完整行做匹配。切行在字节层面进行：
+        // 若对残余整体解码，chunk 恰好落在多字节 UTF-8 序列中间时会被插入
+        // 替换字符，token 就永久毁了。可变状态放引用盒 + 锁（与 pullViaNpx
+        // 的 OutputBox 同一套路）；盒随本次 spawn 新建，一次性标记因此天然
+        // 以“进程”为生命周期——重启后自动复位，可再捕获新进程的新 token。
+        final class TokenScanBox {
+            var residual = Data()  // 尚未凑齐换行的残余字节，等下一个 chunk 拼接
+            var consumed = false   // 一次性标记：首个命中即置位，后续行全部忽略
+        }
+        let scanBox = TokenScanBox()
+        let scanLock = NSLock()
+        // 只编译一次正则：取行内第一个 http(s) URL。字符类排除空白与
+        // 半/全角左右括号，避免把同行随后的 `(LAN: http://...)`（或无空格
+        // 相邻的 `（局域网）`）一起吞进 token；dsh 的 launch URL 本身不含括号。
+        let tokenRegex = try? NSRegularExpression(pattern: #"dsh web:[ \t]*(https?://[^\s()（）]+)"#)
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            if data.isEmpty { return }
-            FileHandle.standardOutput.write(data)
+            // 空数据 = EOF；此时若残余还压着无换行结尾的最后一行，也要冲刷一次
+            guard !data.isEmpty || !scanBox.residual.isEmpty else { return }
+            // 原有转发行为保持不变：后端原始输出继续镜像到应用 stdout 便于排障
+            if !data.isEmpty { FileHandle.standardOutput.write(data) }
+            var captured: URL?
+            scanLock.lock()
+            scanBox.residual.append(data)
+            while let nl = scanBox.residual.firstIndex(of: 0x0A) {
+                let lineBytes = Data(scanBox.residual[..<nl])
+                let after = scanBox.residual.index(after: nl)
+                scanBox.residual = Data(scanBox.residual[after...])
+                guard !scanBox.consumed,
+                      let line = String(data: lineBytes, encoding: .utf8),
+                      let raw = Self.launchTokenRawString(in: line, regex: tokenRegex) else {
+                    continue
+                }
+                // 首个命中即置标记：launch token 每进程只打印一次且一次性使用，
+                // 重复触发只会造成多余的授权加载，故后续一律忽略。
+                // URL 解析失败则静默丢弃：不回调、不报错、不重试。
+                scanBox.consumed = true
+                if let url = URL(string: raw) { captured = url }
+            }
+            if data.isEmpty, !scanBox.residual.isEmpty {
+                // EOF 冲刷：残余此时必无换行（有早在上面循环消费掉了），按整行扫
+                let rest = scanBox.residual
+                scanBox.residual.removeAll()
+                if !scanBox.consumed,
+                   let line = String(data: rest, encoding: .utf8),
+                   let raw = Self.launchTokenRawString(in: line, regex: tokenRegex) {
+                    scanBox.consumed = true
+                    if let url = URL(string: raw) { captured = url }
+                }
+            }
+            scanLock.unlock()
+            guard let url = captured else { return }
+            // 主线程回调：onLaunchTokenURL 是应用层接线点（转存 AppState 供
+            // WebView 首载授权），不能在 pipe 回调线程上碰 @MainActor 状态
+            Task { @MainActor [weak self] in
+                self?.onLaunchTokenURL?(url)
+            }
         }
 
         process.terminationHandler = { [weak self] proc in
@@ -195,6 +254,21 @@ final class ServerManager: ObservableObject {
         try process.run()
         serverProcess = process
         startedByUs = true
+    }
+
+    /// 在单行 stdout 里找 `dsh web: <URL>` 认证行，返回捕获到的原始 URL
+    /// 字符串（不含 `dsh web:` 前缀，首个 http(s) 链接）。
+    /// nonisolated 纯函数：由 pipe 回调线程直接调用，绝不触碰隔离状态。
+    private nonisolated static func launchTokenRawString(
+        in line: String,
+        regex: NSRegularExpression?
+    ) -> String? {
+        guard let regex else { return nil }
+        let ns = line as NSString
+        guard let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+              match.numberOfRanges > 1,
+              match.range(at: 1).location != NSNotFound else { return nil }
+        return ns.substring(with: match.range(at: 1))
     }
 
     /// 只替换首个出现的首 token，避免命令里后续同名子串被误改
@@ -620,7 +694,12 @@ final class ServerManager: ObservableObject {
                         var req = URLRequest(url: url); req.timeoutInterval = 5
                         req.cachePolicy = .reloadIgnoringLocalCacheData
                         if let (_, resp) = try? await URLSession.shared.data(for: req),
-                           (resp as? HTTPURLResponse)?.statusCode == 200 { stable = true }
+                           let code = (resp as? HTTPURLResponse)?.statusCode,
+                           code == 200 || code == 401 {
+                            // 401 也算稳定：新版 dsh 的认证链会拦截未带 Cookie 的
+                            // /api/* 请求，后端在监听即稳定；403 等其他状态仍不算
+                            stable = true
+                        }
                     }
                     if !stable {
                         results.append(CheckResult(id: "稳定性复探", name: "稳定性复探", ok: false,
@@ -809,9 +888,16 @@ final class ServerManager: ObservableObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 1
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                return true
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 200 { return true }
+                if http.statusCode == 401 {
+                    // dsh ≥0.1.2-alpha.1 启用认证链后，未带签名 Cookie 的请求
+                    // 一律 401，但 body 是 dsh 专属文案——收到它说明 HTTP 服务
+                    // 在监听且确是 dsh，应视为“健康、仅缺会话”，而非断连
+                    let body = String(decoding: data, as: UTF8.self)
+                    return body.contains(Self.authChallengeText)
+                }
             }
         } catch {
             // 未连接
@@ -823,6 +909,12 @@ final class ServerManager: ObservableObject {
     /// HTTP 服务都不会带它——这是比“端口返回 200”强得多的身份证据。
     static let identityMarker = "__DSH_BOOT__"
 
+    /// dsh 认证链的 401 响应 body 文案（纯文本、固定字符串）。未带签名
+    /// Cookie 访问根页面 / /api/* 时返回；能收到它说明端口上监听的就是
+    /// 启用了认证链的 dsh，而非恰好占用端口的陌生服务——与 __DSH_BOOT__
+    /// 同级的强身份证据。
+    static let authChallengeText = "dsh web authentication required"
+
     /// 身份确认：除健康检查外，还要求根页面确实是 DSH Web GUI，
     /// 避免把同端口的陌生服务误认成后端而 attach。
     func isDSHInstance(_ url: URL) async -> Bool {
@@ -830,13 +922,21 @@ final class ServerManager: ObservableObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
         guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+              let http = response as? HTTPURLResponse else {
             return false
         }
         // lossy 解码：64KB 窗口若恰好截断多字节 UTF-8 序列，严格解码返回
         // nil 会把真 DSH 误判成陌生服务；replacement 字符不影响标记查找
-        let html = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
-        return html.contains(Self.identityMarker)
+        let body = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
+        if http.statusCode == 200 {
+            return body.contains(Self.identityMarker)
+        }
+        if http.statusCode == 401 {
+            // 认证链启用后未带 Cookie 拿不到根 HTML 属预期，但 401 的 body
+            // 是 dsh 专属认证文案——它本身就是“这是 dsh”的强身份证据
+            return body.contains(Self.authChallengeText)
+        }
+        return false
     }
 }
 

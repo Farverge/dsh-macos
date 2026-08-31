@@ -1,5 +1,20 @@
 # 版本历史
 
+## v1.0.6（2026-08-31）
+
+alpha.2 后端适配——认证链全自动换发（真机端到端验收：壳 spawn alpha.2 → GUI 完整渲染、桥接已连接）：
+
+- **token 捕获**：spawn 的 stdout 逐行扫描（跨 chunk 字节级行缓冲），命中 `dsh web: <url>` 提取一次性 launch token URL，每进程至多一次
+- **WebView 授权导航**：每个新 token 触发一次带稳态门的加载——先等根路径进入稳态（200 / 401+认证文案）再把一次性 token 打出去，避开后端"路由未就绪 404 窗口"（真机实测：窗口期内花掉 token = 本进程授权永久失败白屏）；覆盖首载与断连重连（旧页面挂横幅时新 token 同样触发导航）
+- **健康/身份语义**：isHealthy 接受 401+认证文案；attach 身份判定接受 401 证据；更新稳定性复探接受 401
+- **自检升级**：401 时借 WKWebView 会话 Cookie 重试做真校验；根页面 404 自动复探 8s（启动窗口防误报回滚）
+- **文案**：alpha「已知影响」改为"已适配"口径（版本门控不变）
+
+### 已知限制（alpha.2 运行时，非壳代码）
+
+- 官方 web 工作区（`~/.dsh/profiles/web`）需要 pnpm 装配 `dsh.profile.bundles`（dsh-base/dsh-web-app），首次升级后需手工 `pnpm add`（0.1.2-alpha.2 实测；装完 SPA 才能启动）
+- dsh-mini-dialog 的 client 声明（`dsh.client.inject → @deepseek-ai/dsh-client-runtime`）在 alpha.2 启动图中无此包，会把浏览器端启动图解析炸成白屏——部署副本已摘 client 声明（host API 保留，迷你框后台链路正常，会话级跳转暂缺）；dsh-l10n-zh（纯 client）暂时下架。两者待 dsh-launcher 出兼容 client 包后恢复
+
 ## v1.0.5（2026-08-31）
 
 更新确认窗持续打磨：

@@ -23,13 +23,17 @@ enum UpdateCopy {
 
     /// 影响面细节（橙字）：按目标版本门控——浏览器认证链自 0.1.2-alpha.1 起
     /// 启用且无开关（alpha.2 认证代码与 alpha.1 零差异，见 2026-08-31 源码调查）。
-    /// 目标版本更旧（如未来的 0.1.1-rc.3 重装）时不显示，避免误导。
+    /// 壳 v1.0.5+ 已适配该链路：自有实例自动捕获启动输出的 token 完成授权，
+    /// 外部 attach 实例用其终端里的授权 URL——故文案只作变更告知，不再是
+    /// "未适配会 401"的风险警告。目标版本更旧（如未来的 0.1.1-rc.3 重装）时
+    /// 不显示，避免误导。
     static func backendPrereleaseWarningDetail(for version: String) -> String? {
         // SemVer 对同号不同预发布细号返回 0（只比预发布有无），>=0 恰好覆盖
         // "同号任意 alpha 及其后的正式版"
         guard SemVer.compare(version, "0.1.2-alpha.1") >= 0 else { return nil }
-        return "已知影响：新版启用浏览器认证链（launch token + 签名 Cookie），"
-            + "当前壳未适配会出现页面 401；自检不通过可一键回滚。"
+        return "已知影响：新版启用浏览器认证链（launch token + 签名 Cookie）；"
+            + "本壳 v1.0.6+ 已适配——自有实例自动从启动输出捕获 token 并完成授权，"
+            + "外部 attach 实例需其终端里的授权 URL。"
     }
 
     static func backendFootnote(prerelease: Bool) -> String {

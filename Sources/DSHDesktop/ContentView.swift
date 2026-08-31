@@ -21,7 +21,13 @@ struct ContentView: View {
         // 随 ZStack 默认对齐悬浮在中央；WebView/面板自身撑满，不受影响
         ZStack(alignment: .top) {
             if showWeb {
-                HarnessWebView(url: appState.url) { state in
+                // authURL：后端打印的一次性 token 链接（旧版后端为 nil，
+                // 走裸 URL 首载，行为不变）。消费即清空，防止 token 复用。
+                HarnessWebView(
+                    url: appState.url,
+                    authURL: appState.authLaunchURL,
+                    onAuthConsumed: { appState.authLaunchURL = nil }
+                ) { state in
                     switch state {
                     case .loaded:
                         if !appState.pageLoaded { appState.pageLoaded = true }

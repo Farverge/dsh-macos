@@ -45,6 +45,10 @@ final class AppState: ObservableObject {
     /// 渐进裁剪”的系统性问题。明细只在设置页渲染时读取最新值。
     var bridgeDetail: String = ""
 
+    /// 认证链：后端 stdout 捕获的 launch token URL（每进程一次）。
+    /// 非空且未被消费时，WebView 首载改用该 URL 完成一次性授权换 Cookie。
+    @Published var authLaunchURL: URL?
+
     // MARK: - 窗口增强（持久化）
 
     @Published var immersiveTitlebar: Bool = true
