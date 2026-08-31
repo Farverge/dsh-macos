@@ -282,38 +282,36 @@ struct SettingsView: View {
     // （预取未就绪先显示"加载中…"，失败静默降级为"官方未提供"）。
 
     /// 后端确认窗（rc 稳定版 / alpha 预发布共用）：确认回调才触发原更新管线
+    /// 后端确认窗（rc 稳定版 / alpha 预发布共用）：确认回调才触发原更新管线。
+    /// 全部固定文案取自 UpdateCopy 目录（v1.0.5 去硬编码）。
     private func presentBackendUpdateConfirm(from current: String, to latest: String, prerelease: Bool) {
         let token = UpdateConfirmWindowController.shared.show(
             config: .init(
-                title: prerelease ? "更新 DSH Desktop 后端（预发布）" : "更新 DSH Desktop 后端",
+                title: UpdateCopy.backendTitle(prerelease: prerelease),
                 fromVersion: current,
                 toVersion: latest,
-                warning: prerelease
-                    ? "预发布版本可能不稳定，生产环境请使用稳定版。"
-                    : nil,
-                // 红字只说结论，影响面细节拆到橙字补充行（确认窗 v1.0.3 版式）
+                warning: prerelease ? UpdateCopy.backendPrereleaseWarning : nil,
+                // 影响面按目标版本门控（认证链自 0.1.2-alpha.1 起才有）
                 warningDetail: prerelease
-                    ? "已知影响：新版启用浏览器认证链（launch token + 签名 Cookie），当前壳未适配会出现页面 401；自检不通过可一键回滚。"
+                    ? UpdateCopy.backendPrereleaseWarningDetail(for: latest)
                     : nil,
-                footnote: prerelease
-                    ? "安装后将自动运行兼容性自检；未通过可一键回滚到当前版本。"
-                    : "下载在后台独立进程进行——即使关闭应用，下载进程也不会中断，会继续完成。",
-                confirmTitle: prerelease ? "仍要安装" : "立即更新"),
+                footnote: UpdateCopy.backendFootnote(prerelease: prerelease),
+                confirmTitle: UpdateCopy.backendConfirmTitle(prerelease: prerelease)),
             notes: nil) {
             startUpdate(distTag: prerelease ? "alpha" : "latest", version: latest)
         }
         prefetchNotes(repo: UpdateNotesEngine.dshUpstream, from: current, to: latest, token: token)
     }
 
-    /// 前端应用确认窗
+    /// 前端应用确认窗（文案取自 UpdateCopy 目录）
     private func presentAppUpdateConfirm(_ release: AppSelfUpdater.Release) {
         let token = UpdateConfirmWindowController.shared.show(
             config: .init(
-                title: "更新 DSH Desktop 应用",
+                title: UpdateCopy.appTitle(),
                 fromVersion: appVersion,
                 toVersion: release.version,
-                footnote: "将下载 DSH.MacOS.Desktop.zip（v\(release.version)），校验通过后自动替换并重启。\n旧版本会备份到 ~/Library/Application Support/DSH Backups/ 以便回退。",
-                confirmTitle: "下载并自动更新重启"),
+                footnote: UpdateCopy.appFootnote(version: release.version),
+                confirmTitle: UpdateCopy.appConfirmTitle),
             notes: nil) {
             performAppSelfUpdate(release)
         }
@@ -468,16 +466,17 @@ struct SettingsView: View {
         }
     }
 
-    /// Launcher 确认窗：确认后全自动下载校验 + 插件同步 + 换壳重启（不再跳转 GitHub）
+    /// Launcher 确认窗：确认后全自动下载校验 + 插件同步 + 换壳重启（不再跳转 GitHub；
+    /// 文案取自 UpdateCopy 目录）
     private func presentLauncherUpdateConfirm(_ release: LauncherSelfUpdater.Release,
                                               from current: String) {
         let token = UpdateConfirmWindowController.shared.show(
             config: .init(
-                title: "更新 DSH Launcher",
+                title: UpdateCopy.launcherTitle,
                 fromVersion: current,
                 toVersion: release.version,
-                footnote: "将下载 DSH.Launcher.zip（v\(release.version)），校验通过后自动同步 mini-dialog 插件并换壳重启 Launcher。\n旧版本会备份到 ~/Library/Application Support/DSH Backups/ 以便回退。",
-                confirmTitle: "下载并自动更新重启"),
+                footnote: UpdateCopy.launcherFootnote(version: release.version),
+                confirmTitle: UpdateCopy.launcherConfirmTitle),
             notes: nil) {
             performLauncherSelfUpdate(release)
         }

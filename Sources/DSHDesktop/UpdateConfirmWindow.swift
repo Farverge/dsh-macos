@@ -136,6 +136,11 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         // 全宽视图，行内居中完全由 attributed 段样式决定（见 renderHeader）。
         let headerField = NSTextField(wrappingLabelWithString: "")
         headerField.font = .systemFont(ofSize: 13, weight: .semibold)
+        // 显式钉死不可选中/不可编辑：标签一旦被任何路径送入字段编辑器，
+        // 会以默认排版属性（左对齐+选区白字）重渲染整块——正是用户反馈的
+        // "选中文本变白色且靠左对齐"形态；标签本就不该进入编辑会话。
+        headerField.isSelectable = false
+        headerField.isEditable = false
         headerField.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(headerField)
         self.headerField = headerField
@@ -164,6 +169,9 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         textView.drawsBackground = true
         textView.backgroundColor = .textBackgroundColor
         textView.font = .systemFont(ofSize: 13)   // 与下方 NSAttributedString 正文同源
+        // 选区渲染钉成系统标准（深蓝灰底+前景原色）：不设的话个别路径会退化出
+        // "白字无底色"观感（用户反馈的选中瑕疵之一），显式声明杜绝歧义。
+        textView.selectedTextAttributes = [.backgroundColor: NSColor.selectedTextBackgroundColor]
         self.textView = textView
 
         let scroll = NSScrollView()
@@ -177,6 +185,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         let footnoteField = NSTextField(wrappingLabelWithString: "")
         footnoteField.font = .systemFont(ofSize: 11)
         footnoteField.textColor = .secondaryLabelColor
+        footnoteField.isSelectable = false
+        footnoteField.isEditable = false
         footnoteField.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(footnoteField)
         self.footnoteField = footnoteField
