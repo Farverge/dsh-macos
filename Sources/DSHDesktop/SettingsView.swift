@@ -23,8 +23,9 @@ struct SettingsView: View {
     @State private var isUpdatingApp = false
     // 菜单栏插件管理（轻量：仅打开设置/点刷新时读一次，无后台任务）
     @State private var pluginRunning = false
-    // Launcher 检查更新（卡3）：只在点按钮时联网，无常驻任务
+    // Launcher 更新（卡3→v1.0.3）：点按钮联网查询；确认后全自动安装（对齐前后端链路）
     @State private var isCheckingLauncher = false
+    @State private var isUpdatingLauncher = false
     @State private var launcherUpdateMessage: String?
 
     var body: some View {
@@ -89,15 +90,16 @@ struct SettingsView: View {
                             syncPluginState()
                         }
                         Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
-                            guard !isCheckingLauncher else { return }
+                            guard !isCheckingLauncher, !isUpdatingLauncher else { return }
                             isCheckingLauncher = true
                             launcherUpdateMessage = "正在联网检查 Farverge/DSH-Launcher 最新 Release…"
-                            checkLauncherUpdate(currentVersion: launcherLocalVersion()) { message in
-                                isCheckingLauncher = false
-                                launcherUpdateMessage = message
+                            Task { @MainActor in
+                                defer { isCheckingLauncher = false }
+                                launcherUpdateMessage = await checkLauncherUpdate(
+                                    currentVersion: launcherLocalVersion())
                             }
                         }
-                        .disabled(isCheckingLauncher)
+                        .disabled(isCheckingLauncher || isUpdatingLauncher)
                     }
                     if let launcherUpdateMessage {
                         Text(launcherUpdateMessage)
@@ -287,7 +289,11 @@ struct SettingsView: View {
                 fromVersion: current,
                 toVersion: latest,
                 warning: prerelease
-                    ? "预发布版本可能不稳定，生产环境请使用稳定版；已知影响：浏览器认证链启用——旧版壳可能出现页面 401"
+                    ? "预发布版本可能不稳定，生产环境请使用稳定版。"
+                    : nil,
+                // 红字只说结论，影响面细节拆到橙字补充行（确认窗 v1.0.3 版式）
+                warningDetail: prerelease
+                    ? "已知影响：新版启用浏览器认证链（launch token + 签名 Cookie），当前壳未适配会出现页面 401；自检不通过可一键回滚。"
                     : nil,
                 footnote: prerelease
                     ? "安装后将自动运行兼容性自检；未通过可一键回滚到当前版本。"
@@ -438,62 +444,68 @@ struct SettingsView: View {
         if let v = MenuBarPluginManager.shared.manifest?.version, !v.isEmpty { return v }
         return MenuBarPluginManager.shared.localAppVersion(bundleID: "com.deepseek-ai.dsh-launcher")
     }
-}
 
-// 卡3：Launcher 检查更新——以 Farverge/DSH-Launcher 最新 Release 为版本源，
-// 与本地安装副本 manifest.json 里带的 version 比较；更新逻辑与安全性能参照
-// 主应用自身的"检查应用更新"模式（只提示，不代下载）。
-// currentVersion 由调用方（主线程）先取好——MenuBarPluginManager 是 @MainActor。
-func checkLauncherUpdate(currentVersion: String, _ completion: @escaping (String) -> Void) {
-    guard !currentVersion.isEmpty else {
-        completion("未找到已安装的 Launcher，请先安装后再检查。")
-        return
-    }
-    let url = URL(string: "https://api.github.com/repos/Farverge/DSH-Launcher/releases/latest")!
-    URLSession.shared.dataTask(with: url) { data, response, error in
-        DispatchQueue.main.async {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard error == nil, let data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let newestTag = obj["tag_name"] as? String else {
-                    // 404 = 仓库还没有任何 Release，属正常发布前状态，与网络故障区分开
-                    completion(status == 404
-                               ? "Farverge/DSH-Launcher 尚未发布任何版本（首个 Release 后即可正常检查）"
-                               : "无法检查 Launcher 更新（网络请求失败）")
-                    return
-            }
-            let newest = newestTag.hasPrefix("v") ? String(newestTag.dropFirst()) : newestTag
-            switch compareLauncherVersions(currentVersion, newest) {
-            case 0:
-                completion("Launcher 已是最新版本：\(currentVersion)")
-            case -1:
-                presentLauncherUpdateConfirm(from: currentVersion, to: newest)
-                completion("发现新版 \(newestTag)（当前 \(currentVersion)），更新说明见弹窗。")
-            default:
-                completion("当前 \(currentVersion) 比远端 \(newestTag) 更新（可能是预发布或本地构建），无需更新。")
-            }
+    // MARK: - Launcher 更新（v1.0.3：对齐前后端——自动查询 + 全自动安装）
+
+    /// Launcher 检查更新：版本源 Farverge/DSH-Launcher 最新 Release（连带拿到 zip 资产），
+    /// 与本地 manifest.json 的 version 比较；发现新版直接走确认窗。
+    /// currentVersion 由调用方先取好——MenuBarPluginManager 是 @MainActor。
+    private func checkLauncherUpdate(currentVersion: String) async -> String {
+        guard !currentVersion.isEmpty else {
+            return "未找到已安装的 Launcher，请先安装后再检查。"
         }
-    }.resume()
-}
-
-/// Launcher 新版确认窗（卡3 续：本轮不做自动安装——确认按钮只跳转 Releases 页，
-/// 窗尾保留下载指引文本；notes 预取自 Farverge/DSH-Launcher）
-private func presentLauncherUpdateConfirm(from current: String, to newest: String) {
-    let token = UpdateConfirmWindowController.shared.show(
-        config: .init(
-            title: "更新 DSH Launcher",
-            fromVersion: current,
-            toVersion: newest,
-            footnote: "请前往 https://github.com/Farverge/DSH-Launcher/releases 下载更新。",
-            confirmTitle: "前往 GitHub 下载"),
-        notes: nil) {
-        NSWorkspace.shared.open(
-            URL(string: "https://github.com/Farverge/DSH-Launcher/releases")!)
+        guard let release = await LauncherSelfUpdater.fetchLatestRelease() else {
+            return "无法检查 Launcher 更新（GitHub 请求失败或尚未发布 Release）"
+        }
+        switch compareLauncherVersions(currentVersion, release.version) {
+        case 0:
+            return "Launcher 已是最新版本：v\(currentVersion)"
+        case -1:
+            presentLauncherUpdateConfirm(release, from: currentVersion)
+            return "发现新版 \(release.tag)（当前 v\(currentVersion)），更新说明见弹窗。"
+        default:
+            return "当前 v\(currentVersion) 比远端 \(release.tag) 更新（可能是本地构建），无需更新。"
+        }
     }
-    Task { @MainActor in
-        let notes = await UpdateNotesEngine.fetch(
-            repo: UpdateNotesEngine.launcherRepo, from: current, to: newest)
-        UpdateConfirmWindowController.shared.updateNotes(token: token, notes)
+
+    /// Launcher 确认窗：确认后全自动下载校验 + 插件同步 + 换壳重启（不再跳转 GitHub）
+    private func presentLauncherUpdateConfirm(_ release: LauncherSelfUpdater.Release,
+                                              from current: String) {
+        let token = UpdateConfirmWindowController.shared.show(
+            config: .init(
+                title: "更新 DSH Launcher",
+                fromVersion: current,
+                toVersion: release.version,
+                footnote: "将下载 DSH.Launcher.zip（v\(release.version)），校验通过后自动同步 mini-dialog 插件并换壳重启 Launcher。\n旧版本会备份到 ~/Library/Application Support/DSH Backups/ 以便回退。",
+                confirmTitle: "下载并自动更新重启"),
+            notes: nil) {
+            performLauncherSelfUpdate(release)
+        }
+        prefetchNotes(repo: UpdateNotesEngine.launcherRepo, from: current, to: release.version, token: token)
+    }
+
+    /// Launcher 全自动更新执行（对齐 performAppSelfUpdate 模式）。
+    /// 与应用自更新的关键差异：本应用不退出——被 terminate 的是 Launcher 进程，
+    /// 换壳脚本负责把新版拉起；插件同步在换壳之前完成，失败即整体中止并恢复原状。
+    private func performLauncherSelfUpdate(_ release: LauncherSelfUpdater.Release) {
+        isUpdatingLauncher = true
+        launcherUpdateMessage = "正在自动更新 Launcher 到 \(release.tag)…"
+        Task { @MainActor in
+            do {
+                let payload = try await LauncherSelfUpdater.downloadAndVerify(release: release) { line in
+                    launcherUpdateMessage = (launcherUpdateMessage ?? "") + "\n" + line
+                }
+                try LauncherSelfUpdater.swapAndRelaunch(payload: payload) { line in
+                    launcherUpdateMessage = (launcherUpdateMessage ?? "") + "\n" + line
+                }
+                launcherUpdateMessage = (launcherUpdateMessage ?? "")
+                    + "\nLauncher 已更新到 \(release.tag)，新版即将自动启动。"
+            } catch {
+                launcherUpdateMessage = (launcherUpdateMessage ?? "")
+                    + "\nLauncher 更新失败（已恢复原状）：\(error.localizedDescription)"
+            }
+            isUpdatingLauncher = false
+        }
     }
 }
 
