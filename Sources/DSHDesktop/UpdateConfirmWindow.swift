@@ -88,6 +88,10 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         footnoteField?.isHidden = (config.footnote == nil)
         confirmButton?.title = config.confirmTitle
         renderNotes(notes)
+        // 居中必须在文本落定后写入段样式（见 centerParagraph 注释）
+        centerParagraph(of: versionField)
+        centerParagraph(of: warningField)
+        centerParagraph(of: warningDetailField)
 
         self.onConfirm = onConfirm
         self.onCancel = onCancel
@@ -119,7 +123,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
             defer: false
         )
         win.isReleasedWhenClosed = false    // 单例复用，关窗只 orderOut 不销毁
-        win.level = .floating
+        // 不再置顶（用户反馈）：floating 级会让确认窗盖在所有应用之上；
+        // show() 里保留一次性的 NSApp.activate 保证弹出时拿到焦点即可。
         win.minSize = NSSize(width: 420, height: 480)
         win.escapeAction = { [weak self] in self?.performCancel() }
         win.delegate = self
@@ -219,16 +224,31 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
         ])
-        // 窗口拉伸时增量高度全给 notes 区（其余行按固有高度钉死）：
-        // 低优先级 heightAnchor 约束给出基础高度，超出部分由它"让路"吸收。
-        let scrollHeight = scroll.heightAnchor.constraint(equalToConstant: 340)
-        scrollHeight.priority = .init(750)   // 低于 required，拉伸时由此约束吸收变化
-        scrollHeight.isActive = true
-        scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
-        scroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        // 滚动区是全栈唯一可伸缩行：不设高度锚——曾用 340@750 与栈的拉伸需求
+        // 同优先级打架，窗口宽高同时拉大时 Auto Layout 解不开约束，把多余高度
+        // 塞进了行间空隙（真机实测：脚注与按钮间出现约 30% 窗高的空白）。
+        // 只靠严格最低的 hugging/压缩抗性（249 < 其它行默认 250），.fill 分布下
+        // 窗口高度增减全部由滚动区吸收。
+        scroll.setContentHuggingPriority(.init(249), for: .vertical)
+        scroll.setContentCompressionResistancePriority(.init(249), for: .vertical)
     }
 
     // MARK: - 文案渲染
+
+    /// 多行换行标签的居中必须写进 attributed 段样式：cell.alignment 只对单行
+    /// 生效，折行段落会退化成"整块居中、块内逐行左对齐"（真机实测橙色警示
+    /// 两行折行后左对齐的根因）。attributedStringValue 自带 cell 的字体/颜色，
+    /// 这里只补段样式，不动其余属性。
+    private func centerParagraph(of field: NSTextField?) {
+        guard let field, !field.stringValue.isEmpty else { return }
+        let s = NSMutableAttributedString(attributedString: field.attributedStringValue)
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        para.lineBreakMode = .byWordWrapping
+        s.addAttribute(.paragraphStyle, value: para,
+                       range: NSRange(location: 0, length: s.length))
+        field.attributedStringValue = s
+    }
 
     /// 版本跨度行；跨多版本（notes 就绪且 >1 节）时附"跨 N 个版本"
     private func renderVersionSpan(notes: [ReleaseNotes]?) {
@@ -273,9 +293,27 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
                 attributes: [.font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
                              .paragraphStyle: paragraph])
         }
+        // 版本节之间的虚线分隔：固定长度的短划线串 + 段落居中。长度刻意保守
+        // （约 220pt）：按窗口实时宽度自适应计算的话，宽度一变就得整篇重排；
+        // 短而居中在任意窗口宽度（最小 420）下都既不出界也不显挤，这就是
+        // 分隔符的"尺寸适配"。颜色用二级标签色（曾用三级太暗，宽窗+截图压缩
+        // 下肉眼几乎不可见——真机审计实测误判为"没有分隔线"）。
+        let dashPara = NSMutableParagraphStyle()
+        dashPara.alignment = .center
+        let dashAttr: [NSAttributedString.Key: Any] = [
+            .font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: dashPara,
+        ]
+        let sectionDivider = NSAttributedString(
+            string: String(repeating: "– ", count: 18).trimmingCharacters(in: .whitespaces) + " ",
+            attributes: dashAttr)
         let out = NSMutableAttributedString()
         for (idx, note) in notes.enumerated() {
-            if idx > 0 { out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr)) }
+            if idx > 0 {
+                out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr))
+                out.append(sectionDivider)
+                out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr))
+            }
             out.append(NSAttributedString(string: "── v\(note.version) ──", attributes: headerAttr))
             out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr))
             let body = note.cleanedBody.isEmpty ? "官方未提供本次更新说明" : note.cleanedBody

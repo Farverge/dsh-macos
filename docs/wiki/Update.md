@@ -1,6 +1,6 @@
 # 更新
 
-本应用有两个独立更新入口，都在 **设置 → 关于**。
+本应用有三个独立更新入口：后端与本体在 **设置 → 关于**，Launcher 在 **设置 → 菜单栏插件**。
 
 ---
 
@@ -49,12 +49,24 @@ tccutil reset Accessibility com.deepseek-ai.dsh-desktop
 
 然后到系统设置重新勾选 `/Applications` 里的 DSH Desktop.app 即可，此后跨版本永久稳定。
 
-## 3. 排障
+## 3. Launcher 更新（DSH Launcher）
+
+入口：设置 → 菜单栏插件 → **检查 Launcher 更新**（v1.0.3 起与前两条链路同级的全自动安装）：
+
+1. 读取 `Farverge/DSH-Launcher` 最新 Release（tag 与 `DSH.Launcher.zip` 资产），与本地 manifest.json 版本语义比较
+2. 发现新版 → 确认窗（官方更新说明 + 备份策略）→ 确认后自动执行：
+   - 下载 zip → 解包校验（.app 结构 + 可执行文件 + Info.plist 版本与 Release 一致）
+   - **先同步 mini-dialog 插件**到 `~/.dsh/profiles/node_modules/`（此步失败自动恢复原插件并整体中止，绝不连坐）；幂等维护 `cordis.patch.yml` 装配条目
+   - 退出 Launcher → 分离脚本换壳（旧包备份至 `~/Library/Application Support/DSH Backups/`，保留最近 2 份）→ 自动启动新版
+3. 无新版 / 网络失败均只提示不动作；Launcher 从未安装时提示先安装
+
+## 4. 排障
 
 | 现象 | 处理 |
 |---|---|
 | "检查 DSH 更新"查询失败 | 确认能访问 npm registry 与镜像源 |
 | "检查应用更新"请求失败 | 仓库需已有 Release |
+| "检查 Launcher 更新"请求失败 | 仓库需已有 Release 且含 `DSH.Launcher.zip` 资产 |
 | 更新很久没动静 | 观察进度区；镜像源偶发慢属正常，稍等或重试 |
 | 更新后服务器没自动起来 | 菜单「启动服务器」，或走设置重试一次检查更新 |
 
