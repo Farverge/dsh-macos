@@ -24,6 +24,12 @@
 > [!NOTE]
 > 版本通道说明：更新模块默认只跟 npm 的 `latest` 稳定线。官方预发布走 npm `alpha` dist-tag（如 `0.1.2-alpha.2`，2026-08-30 出现；更早的 alpha.1 曾只打 GitHub tag）——预发布仅在检查结果中以独立按钮提示，需二次确认才安装。手动尝鲜：`npx @deepseek-ai/dsh@alpha`，风险自担。
 
+> [!NOTE]
+> **alpha 通道适配说明（v1.0.6+，2026-09-01 更新至 alpha.3）**：壳已全自动适配 0.1.2-alpha 认证链（stdout 捕获 launch token → WebView 稳态门后换发 Cookie，含断连重连）。alpha 通道使用要点：
+> - 升级后需在 `~/.dsh/profiles/web` 执行一次 `pnpm add @deepseek-ai/dsh-base@<版本> @deepseek-ai/dsh-web-app@<版本>`（官方 web 工作区装配，缺它 SPA 白屏）
+> - 自制插件 bundle 只能经页面启动图（`__DSH_BOOT__`）的合并 URL 加载，纯路径 `/plugins/<id>/client.js` 返回 404 属官方行为（排查勿被误导）
+> - dsh-mini-dialog 自 2026-09-01 起支持 0.1.2-alpha（inject 已改官方 9 包列表）；dsh-l10n-zh 原样可用
+
 ### 桥接版本显示的生效时机
 
 更新后的首次冷启动会让桥接插件重新加载，设置页「桥接信息」即显示真实后端版本（如 `dsh v0.1.1-rc.2`）。仅重启桌面应用而后端存活（attach）时不会刷新插件，属预期。
