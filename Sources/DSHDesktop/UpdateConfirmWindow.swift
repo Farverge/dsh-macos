@@ -1,18 +1,20 @@
 import AppKit
 
-// MARK: - 更新确认独立窗（v1.0.2；本次重排版）
+// MARK: - 更新确认独立窗（v1.0.2 立 / v1.0.3 重排 / v1.0.4 修动态与居中 / 本次弃栈）
 //
 // 为什么用 NSWindow 而不是 SwiftUI .sheet：设置页是 macOS 分组 Form，sheet 高度
 // 受表单布局制约，长更新说明显示不全（用户反馈的"小窗显示不全"正是此因）。
 // 范式参照 dsh-launcher 的 CheckupWindow.swift：独立 NSWindow + NSScrollView +
-// NSTextView，起步可拉伸，notes 只读可滚动、可选中复制。
-// 四条更新链路（后端 rc / 后端 alpha / 前端应用 / Launcher）共用这一个壳，
-// 只换文案与确认回调——更新执行逻辑全部留在 SettingsView 原有函数里，本文件不碰。
+// NSTextView，notes 只读可滚动、可选中复制。四条更新链路（后端 rc / 后端 alpha /
+// 前端应用 / Launcher）共用这一个壳，只换文案与确认回调。
 //
-// 本次重做的动因（真机实测）：旧版说明区整块空白——NSTextView() 以零尺寸创建后
-// 直接塞进 NSScrollView 当 documentView，且缺滚动文档视图的必备配置，导致
-// textContainer 排版宽度恒为 0，一个字形都排不出来（textStorage 里其实有字，
-// 无障碍能读到、肉眼看不见）。同时按反馈改竖版窗口 + 统一左对齐版式 + 警示拆行。
+// 【为什么不再用 NSStackView 排纵向布局（三次翻车的教训）】
+// v1.0.4 前后真机实测踩满三坑：① 默认"重力区"分布把窗口增量的高度变成行间空白；
+// ② 行内 340@750 高度锚与栈拉伸打架，宽高同拉时约束无解、空白落进脚注与按钮间；
+// ③ alignment=.width 对单行换行标签的行宽/行位语义不可控——AX 实测版本行/红行/
+// 脚注整体右贴边（右缘=内容右缘），橙行却全宽，三行各挂各的。本次改为手写约束：
+// 每行显式钉满内容宽，头部三行合并为一个全宽字段，居中由段样式唯一决定，
+// 不再依赖任何字段的 frame 排布。
 
 /// ESC 即取消：NSWindow 本身不响应 Escape（没有 sheet 的 cancel 语义），
 /// 借 cancelOperation 响应链补齐（首个响应者未处理时会冒泡到窗口）。
@@ -33,8 +35,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         var title: String                  // 窗标题：更新 DSH Desktop 后端 / 应用 / Launcher
         var fromVersion: String            // 本地当前版本（空串 = 未解析）
         var toVersion: String              // 目标版本（去 v 前缀）
-        var warning: String? = nil         // 顶部红字警示一行（仅 alpha 通道填；一句话结论）
-        /// 橙色补充说明：红字只说结论，细节（影响面/回滚手段）拆到这行，避免一行塞两件事。
+        var warning: String? = nil         // 红字警示一行（仅 alpha 通道填；一句话结论）
+        /// 橙色补充说明：红字只说结论，细节（影响面/回滚手段）拆到这行。
         /// 带默认值，旧调用点不传也照常编译。
         var warningDetail: String? = nil
         var footnote: String? = nil        // 底部灰字说明（备份策略 / 下载指引）
@@ -42,9 +44,7 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
     }
 
     private var textView: NSTextView?
-    private var versionField: NSTextField?
-    private var warningField: NSTextField?
-    private var warningDetailField: NSTextField?
+    private var headerField: NSTextField?     // 版本跨度+红警示+橙补充 三行合一的全宽居中块
     private var footnoteField: NSTextField?
     private var confirmButton: NSButton?
 
@@ -52,6 +52,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
     private var onCancel: (() -> Void)?
     private var callbacksPending = false   // 回调至多触发一次（确认/取消/ESC/关窗互斥）
     private var shownVersions: (from: String, to: String) = ("", "")
+    private var currentWarning: String?    // show() 落定后暂存，notes 到达重渲染头部时复用
+    private var currentWarningDetail: String?
     private var notesGeneration = 0        // 代际号：只接受最新一次弹窗的 notes 刷新
 
     private init() {
@@ -64,8 +66,8 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
 
     // MARK: - 对外入口
 
-    /// 打开确认窗。notes 传 nil = 预取未就绪（先显示"加载中…"），
-    /// fetch 完成后用返回的代际号调 updateNotes(token:_:) 刷新文本。
+    /// 打开确认窗。notes 传 nil = 预取未就绪（头部与说明区先显示占位），
+    /// fetch 完成后用返回的代际号调 updateNotes(token:_:) 刷新。
     /// 返回代际号，弹窗已关或已换目标时迟到的刷新会被丢弃。
     @discardableResult
     func show(config: Config,
@@ -79,19 +81,13 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         let token = notesGeneration
         win.title = config.title
         shownVersions = (config.fromVersion, config.toVersion)
-        renderVersionSpan(notes: notes)
-        warningField?.stringValue = config.warning ?? ""
-        warningField?.isHidden = (config.warning == nil)          // 栈视图自动收起隐藏行
-        warningDetailField?.stringValue = config.warningDetail ?? ""
-        warningDetailField?.isHidden = (config.warningDetail == nil)
+        currentWarning = config.warning
+        currentWarningDetail = config.warningDetail
         footnoteField?.stringValue = config.footnote ?? ""
         footnoteField?.isHidden = (config.footnote == nil)
         confirmButton?.title = config.confirmTitle
+        renderHeader(notes: notes)
         renderNotes(notes)
-        // 居中必须在文本落定后写入段样式（见 centerParagraph 注释）
-        centerParagraph(of: versionField)
-        centerParagraph(of: warningField)
-        centerParagraph(of: warningDetailField)
 
         self.onConfirm = onConfirm
         self.onCancel = onCancel
@@ -103,14 +99,15 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         return token
     }
 
-    /// notes 预取完成后的刷新入口（token 不匹配 = 迟到的旧结果，直接丢弃）
+    /// notes 预取完成后的刷新入口（token 不匹配 = 迟到的旧结果，直接丢弃）。
+    /// 头部必须一并重渲染：版本行的"跨 N 个版本"后缀只在 notes 到达后出现。
     func updateNotes(token: Int, _ notes: [ReleaseNotes]?) {
         guard token == notesGeneration, window?.isVisible == true else { return }
-        renderVersionSpan(notes: notes)
+        renderHeader(notes: notes)
         renderNotes(notes)
     }
 
-    // MARK: - 窗体搭建
+    // MARK: - 窗体搭建（手写约束，无 NSStackView）
 
     private func buildWindow() {
         // 竖版 480×620：GitHub release notes 本就是竖向阅读排版（窄栏长文），
@@ -123,7 +120,7 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
             defer: false
         )
         win.isReleasedWhenClosed = false    // 单例复用，关窗只 orderOut 不销毁
-        // 不再置顶（用户反馈）：floating 级会让确认窗盖在所有应用之上；
+        // 不置顶（用户反馈）：floating 级会让确认窗盖在所有应用之上；
         // show() 里保留一次性的 NSApp.activate 保证弹出时拿到焦点即可。
         win.minSize = NSSize(width: 420, height: 480)
         win.escapeAction = { [weak self] in self?.performCancel() }
@@ -133,32 +130,22 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 620))
         win.contentView = content
 
-        // —— 版本跨度行（v本地 → v最新（跨 N 个版本））——
-        let versionField = NSTextField(wrappingLabelWithString: "")
-        versionField.font = .systemFont(ofSize: 13, weight: .semibold)
-        versionField.alignment = .center         // 三行头信息统一居中（用户定稿版式）
-        self.versionField = versionField
-
-        // —— 顶部红字警示：只放一句话结论（仅 alpha 通道填文案）——
-        let warningField = NSTextField(wrappingLabelWithString: "")
-        warningField.font = .systemFont(ofSize: 12, weight: .medium)
-        warningField.textColor = .systemRed
-        warningField.alignment = .center
-        self.warningField = warningField
-
-        // —— 橙字补充：红字的细节展开（影响面 / 回滚手段），与红字各占一行 ——
-        let warningDetailField = NSTextField(wrappingLabelWithString: "")
-        warningDetailField.font = .systemFont(ofSize: 12)
-        warningDetailField.textColor = .systemOrange
-        warningDetailField.alignment = .center
-        self.warningDetailField = warningDetailField
+        // —— 头部三行合一（版本跨度 / 红警示 / 橙补充）——
+        // 单字段而非三个字段：字段 frame 的水平排布交给 Auto Layout 后在
+        // 栈语义下不可控（真机实测三行各自右挂）；合一后整块就是一个普通
+        // 全宽视图，行内居中完全由 attributed 段样式决定（见 renderHeader）。
+        let headerField = NSTextField(wrappingLabelWithString: "")
+        headerField.font = .systemFont(ofSize: 13, weight: .semibold)
+        headerField.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(headerField)
+        self.headerField = headerField
 
         // —— notes 只读滚动区 ——
         // 【陷阱：为何要下面六行配置】NSTextView() 零尺寸创建后直接当 documentView，
         // textContainer 的 containerSize 宽度保持 0，且 widthTracksTextView 默认
         // false——container 不会跟随 view 变宽，布局系统拿到的排版宽度恒 0，
         // 一个字形都排不出来：textStorage 里有内容所以无障碍读得到，视觉全空白
-        // （旧版"说明区空白"bug 的根因）。滚动文档的正确姿势是：宽度跟随、
+        // （v1.0.3"说明区空白"bug 的根因）。滚动文档的正确姿势：宽度跟随、
         // 高度无限（交给 scroller 滚），autoresizingMask 同步配 .width，
         // 三者缺一都会退化回"零宽排版"或"横向滚动"。
         let textView = NSTextView()
@@ -167,7 +154,7 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
         // 注：高度用 CGFloat.greatestFiniteMagnitude 而非裸 .greatestFiniteMagnitude——
-        // 本机 CLT(swiftc 6.0.3) 在此位置把裸写法判成 CGFloat/Double 二义性，显式标注基类型。
+        // 本机 CLT(swiftc 6.0.3) 在此位置把裸写法判成 CGFloat/Double 二义性。
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainerInset = NSSize(width: 6, height: 8)
         // —— 六行必备配置到此为止 ——
@@ -183,14 +170,18 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
         scroll.documentView = textView
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(scroll)
 
-        // —— 底部灰字说明（备份策略 / Launcher 下载指引）——
+        // —— 底部灰字说明（备份策略 / 下载指引）——
         let footnoteField = NSTextField(wrappingLabelWithString: "")
         footnoteField.font = .systemFont(ofSize: 11)
         footnoteField.textColor = .secondaryLabelColor
+        footnoteField.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(footnoteField)
         self.footnoteField = footnoteField
 
-        // —— 底部按钮：右侧 [取消] [立即更新]，ESC 挂在取消键上（原生等价键惯例）——
+        // —— 底部按钮：右侧 [取消] [确认]，ESC 挂在取消键上（原生等价键惯例）——
         let cancelButton = NSButton(title: "取消", target: self, action: #selector(cancelClicked))
         cancelButton.bezelStyle = .rounded
         cancelButton.keyEquivalent = "\u{1b}"
@@ -198,64 +189,80 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
         confirmButton.bezelStyle = .rounded
         self.confirmButton = confirmButton
 
-        let spacer = NSView()   // 撑开左侧弹性空隙，把按钮推到右缘
+        // 按钮行仍是横向小栈（水平两元素无对齐歧义，栈只负责排横排）：
+        // 弹性 spacer 把按钮推到右缘。
+        let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         let buttonRow = NSStackView(views: [spacer, cancelButton, confirmButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 10
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(buttonRow)
 
-        // 纵向栈：隐藏的警示/补充/说明行会被自动收起，无需手工挪布局。
-        // alignment 用 .width 让各行随窗口等宽拉伸（正文与警示需要整行宽度换行）；
-        // 【陷阱】distribution 默认按"重力区"分布——窗口拉高时多余高度会变成行间
-        // 空白而不是给滚动区（真机实测：说明区与按钮之间出现大片空隙、滚动区
-        // 不随窗口伸缩）。显式 .fill + 滚动区低 hugging，增减高度全部由它吸收。
-        let stack = NSStackView(views: [versionField, warningField, warningDetailField,
-                                        scroll, footnoteField, buttonRow])
-        stack.orientation = .vertical
-        stack.alignment = .width
-        stack.distribution = .fill
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+        // 手写纵向链：头 → 滚动区 → 脚注 → 按钮行，全部显式钉满内容宽。
+        // 滚动区是唯一低 hugging/低压缩抗性的行（249 < 其它行默认 250），
+        // 窗口高度增减全由它吸收；其余行按固有高度钉死。
+        let m: CGFloat = 20   // 左右/上边距；下边距 16
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            headerField.topAnchor.constraint(equalTo: content.topAnchor, constant: m),
+            headerField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
+            headerField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
+
+            scroll.topAnchor.constraint(equalTo: headerField.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
+
+            footnoteField.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
+            footnoteField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
+            footnoteField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
+
+            buttonRow.topAnchor.constraint(equalTo: footnoteField.bottomAnchor, constant: 12),
+            buttonRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
+            buttonRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
+            buttonRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
-        // 滚动区是全栈唯一可伸缩行：不设高度锚——曾用 340@750 与栈的拉伸需求
-        // 同优先级打架，窗口宽高同时拉大时 Auto Layout 解不开约束，把多余高度
-        // 塞进了行间空隙（真机实测：脚注与按钮间出现约 30% 窗高的空白）。
-        // 只靠严格最低的 hugging/压缩抗性（249 < 其它行默认 250），.fill 分布下
-        // 窗口高度增减全部由滚动区吸收。
         scroll.setContentHuggingPriority(.init(249), for: .vertical)
         scroll.setContentCompressionResistancePriority(.init(249), for: .vertical)
     }
 
     // MARK: - 文案渲染
 
-    /// 多行换行标签的居中必须写进 attributed 段样式：cell.alignment 只对单行
-    /// 生效，折行段落会退化成"整块居中、块内逐行左对齐"（真机实测橙色警示
-    /// 两行折行后左对齐的根因）。attributedStringValue 自带 cell 的字体/颜色，
-    /// 这里只补段样式，不动其余属性。
-    private func centerParagraph(of field: NSTextField?) {
-        guard let field, !field.stringValue.isEmpty else { return }
-        let s = NSMutableAttributedString(attributedString: field.attributedStringValue)
+    /// 头部三行合一渲染：版本跨度（黑 13 semibold）+ 红警示（12 medium）+ 橙补充（12）。
+    /// 居中的可靠性来自两件事：字段被手写约束钉满内容宽；每行段样式 .center。
+    /// 【坑】绝不能用 .stringValue 写这些字段——赋值会整体替换 attributed
+    /// 属性（v1.0.4 曾因 notes 到达后的重设把居中段样式抹掉，出现"跨 N 个版本"
+    /// 后版本行右挂）。
+    private func renderHeader(notes: [ReleaseNotes]?) {
+        guard let headerField else { return }
         let para = NSMutableParagraphStyle()
         para.alignment = .center
         para.lineBreakMode = .byWordWrapping
-        s.addAttribute(.paragraphStyle, value: para,
-                       range: NSRange(location: 0, length: s.length))
-        field.attributedStringValue = s
-    }
 
-    /// 版本跨度行；跨多版本（notes 就绪且 >1 节）时附"跨 N 个版本"
-    private func renderVersionSpan(notes: [ReleaseNotes]?) {
         let from = shownVersions.from.isEmpty ? "当前版本未解析" : "v\(shownVersions.from)"
-        var text = "\(from) → v\(shownVersions.to)"
-        if let notes, notes.count > 1 { text += "（跨 \(notes.count) 个版本）" }
-        versionField?.stringValue = text
+        var span = "\(from) → v\(shownVersions.to)"
+        if let notes, notes.count > 1 { span += "（跨 \(notes.count) 个版本）" }
+
+        let out = NSMutableAttributedString()
+        out.append(NSAttributedString(string: span, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: para,
+        ]))
+        if let warning = currentWarning, !warning.isEmpty {
+            out.append(NSAttributedString(string: "\n" + warning, attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.systemRed,
+                .paragraphStyle: para,
+            ]))
+        }
+        if let detail = currentWarningDetail, !detail.isEmpty {
+            out.append(NSAttributedString(string: "\n" + detail, attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.systemOrange,
+                .paragraphStyle: para,
+            ]))
+        }
+        headerField.attributedStringValue = out
     }
 
     private func renderNotes(_ notes: [ReleaseNotes]?) {
@@ -315,6 +322,18 @@ final class UpdateConfirmWindowController: NSWindowController, NSWindowDelegate 
                 out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr))
             }
             out.append(NSAttributedString(string: "── v\(note.version) ──", attributes: headerAttr))
+            // 官方发布日期（GitHub published_at，运行时取的，非硬编码）：
+            // 以本地时区显示日粒度；解析失败则整行省略——纯展示增强。
+            if let date = note.publishedAt {
+                let f = DateFormatter()
+                f.dateFormat = "yyyy-MM-dd"
+                out.append(NSAttributedString(string: "\n", attributes: bodyAttr))
+                out.append(NSAttributedString(
+                    string: "发布于 \(f.string(from: date))",
+                    attributes: [.font: bodyFont,
+                                 .foregroundColor: NSColor.secondaryLabelColor,
+                                 .paragraphStyle: paragraph]))
+            }
             out.append(NSAttributedString(string: "\n\n", attributes: bodyAttr))
             let body = note.cleanedBody.isEmpty ? "官方未提供本次更新说明" : note.cleanedBody
             out.append(NSAttributedString(string: body, attributes: bodyAttr))

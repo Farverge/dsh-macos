@@ -12,6 +12,7 @@ struct ReleaseNotes {
     let version: String      // 剥掉 dsh-v / v 前缀的纯版本号（SemVer 可比较）
     let tag: String          // GitHub 原始 tag，如 dsh-v0.1.2-alpha.2 / v1.0.1
     let title: String?       // release 的 name 字段（常与 tag 近似；缺失为 nil）
+    let publishedAt: Date?   // GitHub Release 的 published_at（官方发布时间；异常为 nil）
     let cleanedBody: String  // clean() 清洗后的纯文本；空串 = 官方未提供
 }
 
@@ -152,7 +153,18 @@ enum UpdateNotesEngine {
         guard let tag = row["tag_name"] as? String, !tag.isEmpty else { return nil }
         return ReleaseNotes(version: plainVersion(tag), tag: tag,
                             title: row["name"] as? String,
+                            publishedAt: parseDate(row["published_at"] as? String),
                             cleanedBody: clean(row["body"] as? String ?? ""))
+    }
+
+    /// GitHub ISO8601 时间解析（published_at 形如 2026-08-30T12:34:56Z，
+    /// 偶带小数秒）；任何不符返回 nil——日期只是展示增强，不参与任何判定。
+    private static func parseDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let withFrac = ISO8601DateFormatter()
+        withFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFrac.date(from: raw) { return d }
+        return ISO8601DateFormatter().date(from: raw)   // 无小数秒的常规形态
     }
 
     /// tag → 纯版本号：dsh-v0.1.2 → 0.1.2；v1.0.1 → 1.0.1；无前缀原样返回。
