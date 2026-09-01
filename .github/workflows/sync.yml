@@ -2,18 +2,28 @@ name: Safe Sync Code & Wiki to Org
 
 on:
   push:
-    branches: [ "main" ]        # 如果默认分支是 master，请修改
-  workflow_dispatch:            # 允许手动触发
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  # 任务1：同步代码（安全，无强制覆盖）
+  # 任务1：同步代码（含调试步骤）
   sync-code:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # 获取完整历史，便于比较
+          fetch-depth: 0
+
+      # 新增调试步骤：检查 Token 是否存在并输出长度
+      - name: Debug - Check if token secret exists
+        run: |
+          if [ -n "${{ secrets.FARVERGE_ORG_TOKEN }}" ]; then
+            echo "✅ Token exists (length: $(echo -n '${{ secrets.FARVERGE_ORG_TOKEN }}' | wc -c))"
+          else
+            echo "❌ Token is EMPTY!"
+            exit 1
+          fi
 
       - name: Add target repo as remote
         run: |
@@ -21,16 +31,16 @@ jobs:
 
       - name: Fetch latest state of target repo
         run: |
-          git fetch org main    # 实时拉取目标仓库的 main 分支
+          git fetch org main || echo "Target branch not found (repo may be empty)"
 
-      - name: Push only if source is ahead (safe, no force)
+      - name: Push safely (no force)
         run: |
-          git push org main     # 若目标领先，将报错停止，数据不丢失
+          git push org main
 
-  # 任务2：同步 Wiki（完全镜像）
+  # 任务2：同步 Wiki（保持不变）
   sync-wiki:
     runs-on: ubuntu-latest
-    needs: sync-code            # 等待代码同步完成
+    needs: sync-code
     steps:
       - name: Checkout source wiki
         uses: actions/checkout@v4
@@ -44,11 +54,11 @@ jobs:
         run: |
           git clone https://x-access-token:${SYNC_TOKEN}@github.com/Farverge/DSH-MacOS.wiki.git target-wiki
 
-      - name: Sync wiki content (mirror)
+      - name: Sync wiki content
         run: |
           rsync -av --delete --exclude='.git/' source-wiki/ target-wiki/
 
-      - name: Commit and push changes
+      - name: Commit and push
         working-directory: target-wiki
         run: |
           git config user.name "github-actions[bot]"
