@@ -14,35 +14,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Show current git config (debug)
-        run: |
-          echo "--- Current git config ---"
-          git config --list || true
-          echo "--- Extraheader ---"
-          git config http.https://github.com/.extraheader || echo "(not set)"
-
-      - name: Test token with git ls-remote
+      - name: Push directly (remove extraheader first)
         env:
           TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
         run: |
-          echo "Testing ls-remote with token..."
-          git ls-remote https://x-access-token:${TOKEN}@github.com/Farverge/DSH-MacOS.git
-          if [ $? -eq 0 ]; then
-            echo "✅ git ls-remote succeeded - token works for git operations"
-          else
-            echo "❌ git ls-remote failed - token may be invalid or lacking push permission"
-            exit 1
-          fi
-
-      - name: Push directly (bypass credential helper)
-        env:
-          TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
-        run: |
-          # 清除可能干扰的认证头
+          # 关键：在同一个 shell 会话中移除认证头并推送
           git config --local --unset-all http.https://github.com/.extraheader || true
           git config --local credential.helper ""
           
-          # 直接推送
+          # 直接推送（不使用 remote）
           git push --force-with-lease \
             https://x-access-token:${TOKEN}@github.com/Farverge/DSH-MacOS.git \
             main:main
