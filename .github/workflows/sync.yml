@@ -1,0 +1,58 @@
+name: Safe Sync Code & Wiki to Org
+
+on:
+  push:
+    branches: [ "main" ]        # 如果默认分支是 master，请修改
+  workflow_dispatch:            # 允许手动触发
+
+jobs:
+  # 任务1：同步代码（安全，无强制覆盖）
+  sync-code:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 获取完整历史，便于比较
+
+      - name: Add target repo as remote
+        run: |
+          git remote add org https://x-access-token:${{ secrets.FARVERGE_ORG_TOKEN }}@github.com/Farverge/DSH-MacOS.git
+
+      - name: Fetch latest state of target repo
+        run: |
+          git fetch org main    # 实时拉取目标仓库的 main 分支
+
+      - name: Push only if source is ahead (safe, no force)
+        run: |
+          git push org main     # 若目标领先，将报错停止，数据不丢失
+
+  # 任务2：同步 Wiki（完全镜像）
+  sync-wiki:
+    runs-on: ubuntu-latest
+    needs: sync-code            # 等待代码同步完成
+    steps:
+      - name: Checkout source wiki
+        uses: actions/checkout@v4
+        with:
+          repository: iiiiiei/DSH-MacOS.wiki
+          path: source-wiki
+
+      - name: Clone target wiki
+        env:
+          SYNC_TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
+        run: |
+          git clone https://x-access-token:${SYNC_TOKEN}@github.com/Farverge/DSH-MacOS.wiki.git target-wiki
+
+      - name: Sync wiki content (mirror)
+        run: |
+          rsync -av --delete --exclude='.git/' source-wiki/ target-wiki/
+
+      - name: Commit and push changes
+        working-directory: target-wiki
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || git commit -m "Sync wiki from source"
+          git push
