@@ -31,21 +31,49 @@ struct SelfCheckFailure: Error {
 }
 
 /// 语义化版本比较：逐段数字；同号时预发布(-rc/-alpha) < 正式版。
-/// 例：0.1.1-rc.2 < 0.1.1；0.1.2-alpha.2 > 0.1.1-rc.2；0.1.10 > 0.1.9
+/// 例：0.1.1-rc.2 < 0.1.1；0.1.2-alpha.2 > 0.1.1-rc.2；0.1.10 > 0.1.9；
+/// 0.1.2-alpha.2 < 0.1.2-alpha.3；0.1.2-alpha.2 < 0.1.2
 enum SemVer {
+    /// 语义化比较（SemVer 2.0.0 规则）。【真机实测补的洞】旧版只比较核心号
+    /// 加"是否预发布"——同号不同预发布细号（0.1.2-alpha.2 与 0.1.2-alpha.3）
+    /// 返回 0，导致装了 alpha.2 后检查更新永远不出现 alpha.3 的"安装预发布版"
+    /// 按钮（alpha 通道无法迭代）。现按规范完整比较：核心号逐段；无预发布 >
+    /// 有预发布；预发布标识符逐个比——纯数字按数值、数字 < 字母数字、字母数字
+    /// 按 ASCII；前缀相等时标识符少者小。构建元数据（+build）忽略。
     static func compare(_ lhs: String, _ rhs: String) -> Int {
-        let isPre = { (v: String) -> Bool in v.lowercased().contains("-") }
-        let core = { (v: String) -> [Int] in
-            let head = v.split(separator: "-").first.map(String.init) ?? v
-            return head.split(separator: ".").map { Int($0) ?? 0 }
+        let parse = { (v: String) -> (core: [Int], pre: [String]) in
+            let noBuild = v.split(separator: "+").first.map(String.init) ?? v
+            let halves = noBuild.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            let core = (halves.first ?? "").split(separator: ".").map { Int($0) ?? 0 }
+            let pre = halves.count > 1 ? (halves.last ?? "").split(separator: ".").map(String.init) : []
+            return (core, pre)
         }
-        let a = core(lhs), b = core(rhs)
-        for i in 0..<max(a.count, b.count) {
-            let av = i < a.count ? a[i] : 0
-            let bv = i < b.count ? b[i] : 0
+        let a = parse(lhs), b = parse(rhs)
+        for i in 0..<max(a.core.count, b.core.count) {
+            let av = i < a.core.count ? a.core[i] : 0
+            let bv = i < b.core.count ? b.core[i] : 0
             if av != bv { return av < bv ? -1 : 1 }
         }
-        if isPre(lhs) != isPre(rhs) { return isPre(lhs) ? -1 : 1 }
+        switch (a.pre.isEmpty, b.pre.isEmpty) {
+        case (true, true): return 0      // 双方均无预发布
+        case (true, false): return 1     // 正式版 > 预发布
+        case (false, true): return -1
+        default: break                    // 双方都有：逐标识符比
+        }
+        for i in 0..<max(a.pre.count, b.pre.count) {
+            guard i < a.pre.count else { return -1 }   // 标识符少者小
+            guard i < b.pre.count else { return 1 }
+            let x = a.pre[i], y = b.pre[i]
+            if let xi = Int(x), let yi = Int(y) {
+                if xi != yi { return xi < yi ? -1 : 1 }   // 纯数字按数值
+            } else if Int(x) != nil {
+                return -1                                  // 数字 < 字母数字
+            } else if Int(y) != nil {
+                return 1
+            } else if x != y {
+                return x < y ? -1 : 1                      // 字母数字按 ASCII
+            }
+        }
         return 0
     }
 }
