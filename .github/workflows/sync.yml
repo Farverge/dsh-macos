@@ -14,37 +14,58 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 第一步：直接测试 Token 是否有效（用 GitHub API）
-      - name: Test token permissions via API
+      - name: Show current git config (debug)
+        run: |
+          echo "--- Current git config ---"
+          git config --list || true
+          echo "--- Extraheader ---"
+          git config http.https://github.com/.extraheader || echo "(not set)"
+
+      - name: Test token with git ls-remote
         env:
           TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
         run: |
-          if [ -z "$TOKEN" ]; then
-            echo "❌ Token is EMPTY! Please set FARVERGE_ORG_TOKEN secret."
-            exit 1
-          fi
-          echo "✅ Token exists (length: ${#TOKEN})"
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" \
-            https://api.github.com/repos/Farverge/DSH-MacOS)
-          if [ "$RESPONSE" -eq 200 ]; then
-            echo "✅ Token has read access to target repo."
-          elif [ "$RESPONSE" -eq 403 ]; then
-            echo "❌ Token does NOT have permission to target repo (403). Please regenerate classic token with 'repo' scope."
-            exit 1
+          echo "Testing ls-remote with token..."
+          git ls-remote https://x-access-token:${TOKEN}@github.com/Farverge/DSH-MacOS.git
+          if [ $? -eq 0 ]; then
+            echo "✅ git ls-remote succeeded - token works for git operations"
           else
-            echo "⚠️ Unexpected HTTP response: $RESPONSE"
+            echo "❌ git ls-remote failed - token may be invalid or lacking push permission"
             exit 1
           fi
 
-      # 第二步：添加远程并尝试推送（使用 Token）
-      - name: Add target repo as remote
+      - name: Push directly (bypass credential helper)
+        env:
+          TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
         run: |
-          git remote add org https://x-access-token:${{ secrets.FARVERGE_ORG_TOKEN }}@github.com/Farverge/DSH-MacOS.git
+          # 清除可能干扰的认证头
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --local credential.helper ""
+          
+          # 直接推送
+          git push --force-with-lease \
+            https://x-access-token:${TOKEN}@github.com/Farverge/DSH-MacOS.git \
+            main:main
 
-      - name: Fetch target (ignore if empty)
-        run: |
-          git fetch org main || echo "Target branch not found, will push from scratch"
+  sync-wiki:
+    runs-on: ubuntu-latest
+    needs: sync-code
+    steps:
+      - name: Checkout source wiki
+        uses: actions/checkout@v4
+        with:
+          repository: iiiiiei/DSH-MacOS.wiki
+          path: source-wiki
 
-      - name: Push safely (no force)
+      - name: Clone and sync target wiki
+        env:
+          TOKEN: ${{ secrets.FARVERGE_ORG_TOKEN }}
         run: |
-          git push -u org main || git push -u org main --force-with-lease
+          git clone https://x-access-token:${TOKEN}@github.com/Farverge/DSH-MacOS.wiki.git target-wiki
+          rsync -av --delete --exclude='.git/' source-wiki/ target-wiki/
+          cd target-wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || git commit -m "Sync wiki from source"
+          git push
