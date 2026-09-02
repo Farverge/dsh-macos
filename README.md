@@ -61,7 +61,10 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 - **后端进程全托管**：启动时以「HTTP 200 + 官方标记」双重身份探测已有实例并直接接管（绝不双开后端），六级命令解析链摆脱 PATH 依赖，健康轮询 + 断连横幅自动重试且不丢页面状态
 - **会话导出**：自动保存到「下载」文件夹并弹系统通知、定位文件
 - **桌面布局 overlay**：红绿灯锚定的沉浸式标题栏、折叠侧栏居中适配——纯 CSS 实现，跟随官方界面更新
-- **DSH 后端更新**：设置里一键检查，镜像源加速下载、完整性校验、自动清理旧缓存（跳过使用中的目录）并重启
+- **DSH 后端更新**：设置里一键检查——三级版本查询（npm 官方 → npmmirror → GitHub tags）、三级下载安装、更新前快照 + 兼容性自检 + 一键回滚；rc 稳定 / alpha 预发布双通道独立确认窗（展示官方发布说明与发布日期）
+- **认证链自动适配**：0.1.2-alpha 后端的浏览器认证链（launch token + 签名 Cookie）全自动换发，断连重连同样覆盖
+- **应用自更新**：应用本体检查 GitHub Releases，下载校验后自动换壳重启，旧版本备份可回退
+- **dsh-plugins-norm 协议层（可选生态组件）**：对外屏蔽官方版本漂移——家族插件只依赖其稳定面（caps 体检 / 会话跳转 / 事件通道），官方迭代适配收敛到一处
 - **桥接插件**：向系统注入服务器状态接口（pid / 版本 / 运行时长），并为插件生态预留原生通知通道
 - **可选菜单栏插件 DSH Launcher**：独立小应用，鲸鱼常驻菜单栏一键唤起
 
@@ -72,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 ```text
 UI 层      SwiftUI/AppKit —— 状态面板 ⇄ WebView 切换、原生菜单、设置
 Web 层     WKWebView 内嵌官方 GUI + 纯 CSS 布局 overlay
-进程层     ServerManager —— 身份探测/唯一性保证/解析链/轮询/更新链
+进程层     ServerManager —— 身份探测/唯一性保证/解析链/轮询/更新链/退出信号引导（杜绝孤儿后端）
 桥接层     dsh-desktop-bridge 插件（status / notify 路由）
 ```
 

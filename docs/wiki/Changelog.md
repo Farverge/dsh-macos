@@ -1,8 +1,8 @@
 # 版本历史
 
-## v1.0.7（2026-09-01）
+## v1.0.7（2026-09-01，同日热修 09-01）
 
-0.1.2-alpha.3 兼容版（壳零改动验证）+ 退出孤儿后端修复：
+0.1.2-alpha.3 兼容版（壳零改动验证）+ 退出孤儿后端修复。**同日热修**：`SemVer.compare` 补预发布细号比较（SemVer 2.0.0 规则，14 例测试）——旧版同号预发布返回 0，装 alpha.2 后检查更新永远不出现 alpha.3 安装按钮；Release 资产已替换为含修复构建：
 
 - **alpha.3 适配度**：壳依赖的 6 个关键文件（认证链/启动图/插件扫描/stdout 打印/前端门禁/RPC 门禁）alpha.2↔alpha.3 逐字节相同；沙箱全链复验（token 正则、404→401 启动序列、303+Cookie、401 文案）通过——**v1.0.6 起的壳无需任何改动即可运行 alpha.3**
 - **修复退出孤儿后端**：killall/强退/注销等 SIGTERM 类退出不走 applicationWillTerminate，自 spawn 的后端曾实测变成孤儿 node 继续占端口；现将 SIGTERM/SIGINT/SIGHUP 引导回 NSApp.terminate，停服清理恢复生效（SIGKILL 不可捕获，由下次启动的 attach 机制良性接管）

@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 | 通知 | 无 | UserNotifications 原生通知 |
 | 会话导出 | 手动 | 拦截保存到 `~/Downloads` + 通知 + Finder 定位 |
 | 断连 | 页面失效 | WebView 保留 + 顶部横幅自动重试 |
-| 更新 | 手动 npm | 先查后问：镜像拉取→校验→清缓存→自动重启 |
+| 更新 | 手动 npm | 三级版本查询 + 快照/自检/一键回滚 + rc/alpha 双通道 + 认证链自动适配 |
 
 ## 文档导航
 
@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 | [使用](Usage.md) | 所有用户 | 安装、界面、设置、插件、通知、导出 |
 | [更新](Update.md) | 所有用户 | DSH 后端更新与应用更新的准确流程 |
 | [常见问题](FAQ.md) | 所有用户 | 现象与排查 |
-| [版本历史](Changelog.md) | 所有人 | v1.0.0 变更全记录 |
+| [版本历史](Changelog.md) | 所有人 | v1.0.0 – v1.0.7 变更全记录 |
 
 ## 快速 FAQ
 
