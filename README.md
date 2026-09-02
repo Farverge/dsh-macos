@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 - **DSH 后端更新**：设置里一键检查——三级版本查询（npm 官方 → npmmirror → GitHub tags）、三级下载安装、更新前快照 + 兼容性自检 + 一键回滚；rc 稳定 / alpha 预发布双通道独立确认窗（展示官方发布说明与发布日期）
 - **认证链自动适配**：0.1.2-alpha 后端的浏览器认证链（launch token + 签名 Cookie）全自动换发，断连重连同样覆盖
 - **应用自更新**：应用本体检查 GitHub Releases，下载校验后自动换壳重启，旧版本备份可回退
-- **dsh-plugins-norm 协议层（可选生态组件）**：对外屏蔽官方版本漂移——家族插件只依赖其稳定面（caps 体检 / 会话跳转 / 事件通道），官方迭代适配收敛到一处
+- **dsh-plugin-norm 协议层（可选生态组件）**：对外屏蔽官方版本漂移——家族插件只依赖其稳定面（caps 体检 / 会话跳转 / 事件通道），官方迭代适配收敛到一处
 - **桥接插件**：向系统注入服务器状态接口（pid / 版本 / 运行时长），并为插件生态预留原生通知通道
 - **可选菜单栏插件 DSH Launcher**：独立小应用，鲸鱼常驻菜单栏一键唤起
 
