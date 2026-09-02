@@ -625,7 +625,7 @@ enum AppSelfUpdater {
     }
 
     static func fetchLatestRelease() async -> Release? {
-        guard let url = URL(string: "https://api.github.com/repos/Farverge/DSH-MacOS/releases/latest") else { return nil }
+        guard let url = URL(string: "https://api.github.com/repos/iiiiiei/dsh-macos/releases/latest") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalCacheData

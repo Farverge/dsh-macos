@@ -58,7 +58,7 @@ enum LauncherSelfUpdater {
 
     /// 请求头/超时/无缓存与 AppSelfUpdater.fetchLatestRelease 完全一致。
     static func fetchLatestRelease() async -> Release? {
-        guard let url = URL(string: "https://api.github.com/repos/Farverge/DSH-Launcher/releases/latest") else { return nil }
+        guard let url = URL(string: "https://api.github.com/repos/iiiiiei/dsh-launcher/releases/latest") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalCacheData

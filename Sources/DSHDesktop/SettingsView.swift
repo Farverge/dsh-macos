@@ -80,7 +80,7 @@ struct SettingsView: View {
                             }
                         ))
                     }
-                    // 卡3 定稿：Launcher 的版本源 = Farverge/DSH-Launcher 的 Release
+                    // 卡3 定稿：Launcher 的版本源 = iiiiiei/dsh-launcher 的 Release
                     // （与主应用的"检查 DSH 更新"是两条独立链路，不共用版本源）
                     // 真机 R2：分组表单给每个按钮各分配一行，相邻也留空——两个按钮
                     // 并排进同一 HStack，空白行从结构上消失
@@ -92,7 +92,7 @@ struct SettingsView: View {
                         Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
                             guard !isCheckingLauncher, !isUpdatingLauncher else { return }
                             isCheckingLauncher = true
-                            launcherUpdateMessage = "正在联网检查 Farverge/DSH-Launcher 最新 Release…"
+                            launcherUpdateMessage = "正在联网检查 iiiiiei/dsh-launcher 最新 Release…"
                             Task { @MainActor in
                                 defer { isCheckingLauncher = false }
                                 launcherUpdateMessage = await checkLauncherUpdate(
@@ -445,7 +445,7 @@ struct SettingsView: View {
 
     // MARK: - Launcher 更新（v1.0.3：对齐前后端——自动查询 + 全自动安装）
 
-    /// Launcher 检查更新：版本源 Farverge/DSH-Launcher 最新 Release（连带拿到 zip 资产），
+    /// Launcher 检查更新：版本源 iiiiiei/dsh-launcher 最新 Release（连带拿到 zip 资产），
     /// 与本地 manifest.json 的 version 比较；发现新版直接走确认窗。
     /// currentVersion 由调用方先取好——MenuBarPluginManager 是 @MainActor。
     private func checkLauncherUpdate(currentVersion: String) async -> String {
