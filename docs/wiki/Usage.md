@@ -8,13 +8,23 @@
 
 ## 1. 安装
 
-一键命令（推荐）：
+一键命令（推荐，两个发布源任选其一）：
+
+**抢先源（iiiiiei，第一时间获取最新版）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iiiiiei/dsh-macos/main/install.sh | bash
+```
+
+**稳定镜像源（Farverge，可能与抢先源存在同步延迟）：**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 ```
 
-手动方式：到 [Releases](https://github.com/Farverge/DSH-MacOS/releases) 下载 `DSH.MacOS.Desktop.zip`，解压后把 `DSH Desktop.app` 拖入 /Applications。
+> 注：抢先源第一时间获取最新版；稳定镜像源版本可能滞后于抢先源（两源差异详见 README「一键安装」）。
+
+手动方式：到 Releases 下载 `DSH.MacOS.Desktop.zip`（[抢先源](https://github.com/iiiiiei/dsh-macos/releases) · [稳定镜像](https://github.com/Farverge/DSH-MacOS/releases)），解压后把 `DSH Desktop.app` 拖入 /Applications。
 
 前提：**macOS 13+**、已安装 **Node.js**（终端 `node -v` 有输出）。应用启动时会自动拉起 dsh 后端。
 
@@ -66,7 +76,10 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 ## 6. 插件
 
 ### DSH Launcher（菜单栏常驻，独立仓库可选装）
-鲸鱼图标常驻菜单栏，左键唤起主应用。安装于 `~/Library/Application Support/DSH Launcher.app`（启动台不显示）；不装不影响任何功能。
+鲸鱼图标常驻菜单栏，左键唤起主应用。安装于 `~/Library/Application Support/DSH Launcher.app`（启动台不显示）；不装不影响任何功能。Launcher 与 norm 相互独立：安装 Launcher 不附带 norm。
+
+### dsh-plugin-norm 协议层（独立选装，独立仓库）
+norm 为独立选装组件（仓库 [iiiiiei/dsh-plugin-norm](https://github.com/iiiiiei/dsh-plugin-norm)，当前 1.1.0），与 DSH Launcher 分属两个独立仓库、分开选装，launcher 一键安装不含它；mini-dialog 0.2.1+ 的会话跳转依赖它（norm ≥ 1.0.1）。部署方式：将插件拷入 `~/.dsh/profiles/web/node_modules/`，在 `cordis.patch.yml` 中添加对应装配条目，重启后生效。
 
 ### 桥接插件 dsh-desktop-bridge（已内置）
 随 v1.0.0 内置部署于 dsh 配置目录，为设置页「状态」提供 pid / 版本 / 运行时长，并为生态预留 `/api/desktop/notify` 原生通知通道。无需用户做任何事。

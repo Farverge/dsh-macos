@@ -614,18 +614,56 @@ enum UpdateSafety {
 
 // MARK: - 前端应用自更新（v1.0.1）
 
+/// GitHub Release `published_at` 的防御性解析（双源一致性弹窗要展示各源的发布时间）。
+/// 为什么单独封装：GitHub API 文档承诺 ISO8601，但真实响应里"带小数秒 / 不带小数秒"
+/// 两种形态都出现过（不同网关、代理可能改写），所以各试一次、全失败返回 nil——
+/// 弹窗对 nil 的兜底是「发布时间未知」，绝不因时间字段解析失败丢弃整个 Release
+/// （版本号与 zip 资产才是更新链的硬依赖，时间只是展示性信息）。
+enum ReleaseTimeParser {
+    /// ISO8601 双形态解析：带小数秒优先（信息更全），失败退回无小数秒形态
+    static func parse(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: raw) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+    }
+
+    /// 弹窗展示用「YYYY-MM-DD」。固定格式必须锁 en_US_POSIX：不锁的话用户系统地区
+    /// 为非公历（如佛历、 Islamic）时会输出意外历法文本；入参 nil 返回 nil，
+    /// 由调用方显示「发布时间未知」。
+    static func dayString(_ date: Date?) -> String? {
+        guard let date else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+}
+
 /// 应用自身更新：GitHub Release 查询（防降级）→ 下载校验 → 暂存换壳 → 分离脚本换入并重启。
 /// 与后端更新同一安全哲学：任一步失败不动现有安装；换壳动作由脱离本进程的脚本完成
 /// （应用不能可靠地替换正在运行的自身）。
 enum AppSelfUpdater {
+    /// 双发布源：iiiiiei 个人仓 = 抢先发布（第一现场）；Farverge 组织仓 = 用户侧
+    /// 稳定镜像（由 Actions 自动同步，存在分钟级延迟）。镜像仓库名保持小写。
+    /// 双源意义：主源改动快但偶有回补/重发，镜像可交叉验证"用户实际会拿到什么"，
+    /// 两源不一致时弹窗向用户交代差异，而不是静默挑一个装。
+    static let primaryRepo = "iiiiiei/dsh-macos"
+    static let mirrorRepo = "Farverge/dsh-macos"
+
     struct Release {
         let tag: String            // 形如 v1.0.1
         let version: String        // 去掉 v 前缀
         let zipURL: URL?           // 稳定名资产 DSH.MacOS.Desktop.zip
+        let publishedAt: Date?     // published_at 解析结果（nil = 解析失败 → 弹窗显示「发布时间未知」）
     }
 
-    static func fetchLatestRelease() async -> Release? {
-        guard let url = URL(string: "https://api.github.com/repos/iiiiiei/dsh-macos/releases/latest") else { return nil }
+    /// repo 带默认值 = 主源，既有调用点零改动；双源检查时由调用方传 mirrorRepo 取镜像源。
+    static func fetchLatestRelease(repo: String = "iiiiiei/dsh-macos") async -> Release? {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -645,7 +683,8 @@ enum AppSelfUpdater {
                     return URL(string: link)
                 }.first
             }
-            return Release(tag: tag, version: version, zipURL: zipURL)
+            return Release(tag: tag, version: version, zipURL: zipURL,
+                           publishedAt: ReleaseTimeParser.parse(obj["published_at"] as? String))
         } catch {
             return nil
         }

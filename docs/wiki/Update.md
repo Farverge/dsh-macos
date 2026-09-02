@@ -37,13 +37,19 @@
 
 ## 2. 应用本体更新（DSH Desktop）
 
-- 重新运行一键安装命令即可覆盖到最新版：
+- 重新运行一键安装命令即可覆盖到最新版（两个发布源任选其一）：
 
 ```bash
+# 抢先源（iiiiiei，第一时间获取最新版）
+curl -fsSL https://raw.githubusercontent.com/iiiiiei/dsh-macos/main/install.sh | bash
+
+# 稳定镜像源（Farverge，可能与抢先源存在同步延迟）
 curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 ```
 
-- 或到 [Releases](https://github.com/Farverge/DSH-MacOS/releases) 手动下载 `DSH.MacOS.Desktop.zip`
+> 注：抢先源（iiiiiei）第一时间获取最新版；稳定镜像源（Farverge）由 Actions 自动同步 main 分支与 Wiki，Release 不参与同步，版本可能滞后于抢先源。
+
+- 或到 Releases 手动下载 `DSH.MacOS.Desktop.zip`（[抢先源](https://github.com/iiiiiei/dsh-macos/releases) · [稳定镜像](https://github.com/Farverge/DSH-MacOS/releases)）
 - 应用内「检查应用更新」读取 GitHub Releases 最新 tag，语义化比较（远端较旧视为最新，防降级误报）；发现新版确认后自动下载 DSH.MacOS.Desktop.zip → 结构与版本校验 → 暂存换壳 → 自动重启，旧版备份到 `~/Library/Application Support/DSH Backups/`
 
 ### 权限说明

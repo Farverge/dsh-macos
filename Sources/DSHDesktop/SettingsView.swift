@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ServiceManagement
 
@@ -92,7 +93,7 @@ struct SettingsView: View {
                         Button(isCheckingLauncher ? "检查中…" : "检查 Launcher 更新") {
                             guard !isCheckingLauncher, !isUpdatingLauncher else { return }
                             isCheckingLauncher = true
-                            launcherUpdateMessage = "正在联网检查 iiiiiei/dsh-launcher 最新 Release…"
+                            launcherUpdateMessage = "正在联网检查两个发布源（\(LauncherSelfUpdater.primaryRepo) / \(LauncherSelfUpdater.mirrorRepo)）的最新 Release…"
                             Task { @MainActor in
                                 defer { isCheckingLauncher = false }
                                 launcherUpdateMessage = await checkLauncherUpdate(
@@ -130,12 +131,36 @@ struct SettingsView: View {
                 Button(isUpdatingApp ? "应用更新中…" : (isCheckingApp ? "检查中…" : "检查应用更新")) {
                     guard !isCheckingApp, !isUpdatingApp else { return }
                     isCheckingApp = true
-                    updateMessage = "正在检查 GitHub 最新版本…"
+                    updateMessage = "正在检查两个发布源的最新版本…"
                     Task { @MainActor in
                         defer { isCheckingApp = false }
-                        guard let release = await AppSelfUpdater.fetchLatestRelease() else {
+                        // 双发布源：主源（iiiiiei）= 抢先发布；镜像源（Farverge）= Actions
+                        // 自动同步的稳定镜像，存在分钟级延迟。先主后镜，两源都失败才报
+                        // 「无法检查」——只要还有一个源活着，检查就有结果可用。
+                        let primary = await AppSelfUpdater.fetchLatestRelease()
+                        let mirror = await AppSelfUpdater.fetchLatestRelease(repo: AppSelfUpdater.mirrorRepo)
+                        guard primary != nil || mirror != nil else {
                             updateMessage = "无法检查应用更新（GitHub 请求失败）"
                             return
+                        }
+                        // 两源 tag 一致 → 完全静默走既有流程（不打扰用户，镜像延迟的
+                        // 分钟级窗口内两源本来就常见短暂不一致，一致才是常态）；
+                        // 不一致（含单源缺失/失败）→ 先弹双源说明弹窗，再进更新确认窗。
+                        let release: AppSelfUpdater.Release
+                        if let p = primary, let m = mirror, p.tag == m.tag {
+                            release = p
+                        } else {
+                            guard let chosen = await presentSourceMismatch(
+                                component: "DSH Desktop",
+                                primaryRepo: AppSelfUpdater.primaryRepo, primary: primary,
+                                mirrorRepo: AppSelfUpdater.mirrorRepo, mirror: mirror,
+                                versionOf: { $0.version }, publishedAtOf: { $0.publishedAt },
+                                compare: SemVer.compare)
+                            else {
+                                updateMessage = "已取消：两发布源版本不一致，本次检查中止，未做任何改动。"
+                                return
+                            }
+                            release = chosen
                         }
                         let cmp = SemVer.compare(appVersion, release.version)
                         if cmp >= 0 {
@@ -443,17 +468,98 @@ struct SettingsView: View {
         return MenuBarPluginManager.shared.localAppVersion(bundleID: "com.deepseek-ai.dsh-launcher")
     }
 
+    // MARK: - 双发布源一致性弹窗（应用 / Launcher 两条检查链路共用）
+
+    /// 双源版本不一致弹窗：与"更新后自检未通过"回滚弹窗同款 NSAlert（.informational）。
+    /// 时机：在检查按钮的 Task 内主线程弹出，且必须先于更新确认窗——用户得先知道
+    /// "两源各是什么版本、装的是哪个"，再谈装不装。泛型 + 取值闭包把两种 Release
+    /// （AppSelfUpdater.Release / LauncherSelfUpdater.Release）抹平，弹窗逻辑只写一份；
+    /// compare 约定与 SemVer.compare 相同（>0 = 第一参数更新）。
+    /// 返回：用户选定要安装的源（版本较新的一方）；nil = 用户点「取消」，中止本次检查。
+    @MainActor
+    private func presentSourceMismatch<T>(component: String,
+                                          primaryRepo: String, primary: T?,
+                                          mirrorRepo: String, mirror: T?,
+                                          versionOf: (T) -> String,
+                                          publishedAtOf: (T) -> Date?,
+                                          compare: (String, String) -> Int) async -> T? {
+        // 选边：版本较新的一方为安装目标。仅单源存活时唯一解；版本打平但 tag 不一致
+        // （写法差异等罕见情形）保守取主源——抢先源是发布的第一现场。
+        let chosen: T
+        let chosenRepo: String
+        switch (primary, mirror) {
+        case (let p?, let m?):
+            let c = compare(versionOf(p), versionOf(m))
+            if c > 0 { chosen = p; chosenRepo = primaryRepo }
+            else if c < 0 { chosen = m; chosenRepo = mirrorRepo }
+            else { chosen = p; chosenRepo = primaryRepo }
+        case (let p?, nil): chosen = p; chosenRepo = primaryRepo
+        case (nil, let m?): chosen = m; chosenRepo = mirrorRepo
+        default: return nil   // 双源皆空不会走到这（调用方已提前拦截），防御性返回取消
+        }
+        // 逐源行：版本（发布于 YYYY-MM-DD）；缺失源标注、时间解析失败兜底
+        let line = { (repo: String, release: T?) -> String in
+            guard let release else { return "\(repo)：无 Release 或查询失败" }
+            let when = ReleaseTimeParser.dayString(publishedAtOf(release))
+                .map { "发布于 \($0)" } ?? "发布时间未知"
+            return "\(repo)：v\(versionOf(release))（\(when)）"
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "发布源版本不一致：\(component)"
+        alert.informativeText = [line(primaryRepo, primary), line(mirrorRepo, mirror)]
+            .joined(separator: "\n")
+            + "\n\n将安装较新的 v\(versionOf(chosen))（来源 \(chosenRepo)）。镜像同步存在延迟属正常。"
+        alert.addButton(withTitle: "安装较新版本 v\(versionOf(chosen))")   // 首按钮 = default
+        alert.addButton(withTitle: "取消")
+        // sheet 锚定当前设置窗优先（形态与回滚弹窗一致）；拿不到 window 引用（窗口未
+        // key 等边缘态）退回 runModal。检查态布尔值在弹窗期间保持 true，按钮维持禁用。
+        let response: NSApplication.ModalResponse
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            response = await withCheckedContinuation { continuation in
+                alert.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+            }
+        } else {
+            response = alert.runModal()
+        }
+        return response == .alertFirstButtonReturn ? chosen : nil
+    }
+
     // MARK: - Launcher 更新（v1.0.3：对齐前后端——自动查询 + 全自动安装）
 
-    /// Launcher 检查更新：版本源 iiiiiei/dsh-launcher 最新 Release（连带拿到 zip 资产），
-    /// 与本地 manifest.json 的 version 比较；发现新版直接走确认窗。
+    /// Launcher 检查更新：双发布源（iiiiiei 抢先源 + Farverge 稳定镜像）最新 Release，
+    /// 与本地 manifest.json 的 version 做"本地 vs 双源"三方比较；发现新版直接走确认窗。
     /// currentVersion 由调用方先取好——MenuBarPluginManager 是 @MainActor。
+    ///
+    /// 组合逻辑（本地 × 双源）：
+    /// · 双源 tag 一致 → 退化为单源语义：本地最新 / 远端较新（进确认窗）/ 本地较新
+    ///   （可能是本地构建），完全静默不弹窗；
+    /// · 双源不一致（含单源缺失/失败）→ 先弹双源说明弹窗，以用户认可的"较新源"结果
+    ///   作为远端版本，再回到上述本地 vs 远端比较——即使镜像较新、本地又比两个源都新
+    ///   （极端情形），也会落到"本地较新，无需更新"分支，天然防降级。
     private func checkLauncherUpdate(currentVersion: String) async -> String {
         guard !currentVersion.isEmpty else {
             return "未找到已安装的 Launcher，请先安装后再检查。"
         }
-        guard let release = await LauncherSelfUpdater.fetchLatestRelease() else {
+        let primary = await LauncherSelfUpdater.fetchLatestRelease()
+        let mirror = await LauncherSelfUpdater.fetchLatestRelease(repo: LauncherSelfUpdater.mirrorRepo)
+        guard primary != nil || mirror != nil else {
             return "无法检查 Launcher 更新（GitHub 请求失败或尚未发布 Release）"
+        }
+        let release: LauncherSelfUpdater.Release
+        if let p = primary, let m = mirror, p.tag == m.tag {
+            release = p
+        } else {
+            guard let chosen = await presentSourceMismatch(
+                component: "DSH Launcher",
+                primaryRepo: LauncherSelfUpdater.primaryRepo, primary: primary,
+                mirrorRepo: LauncherSelfUpdater.mirrorRepo, mirror: mirror,
+                versionOf: { $0.version }, publishedAtOf: { $0.publishedAt },
+                compare: compareLauncherVersions)
+            else {
+                return "已取消：两发布源版本不一致，本次检查中止，未做任何改动。"
+            }
+            release = chosen
         }
         switch compareLauncherVersions(currentVersion, release.version) {
         case 0:

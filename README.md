@@ -23,11 +23,21 @@
 
 ## 一键安装
 
-打开终端，复制粘贴这一条命令：
+打开终端，复制粘贴以下命令（两个发布源任选其一）：
+
+**抢先源（iiiiiei，第一时间获取最新版）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iiiiiei/dsh-macos/main/install.sh | bash
+```
+
+**稳定镜像源（Farverge，可能与抢先源存在同步延迟）：**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash
 ```
+
+> 注：iiiiiei 个人仓为抢先发布源，第一时间获取最新版；Farverge 组织仓为面向用户的稳定镜像（Actions 自动同步 main 分支与 Wiki，Release 不参与同步），其版本可能滞后于抢先源。两源安装脚本一致，按需任选。
 
 也可以**复制这段命令发给你正在使用的 AI agent**，它会自动完成安装部署并处理过程中的所有提示。
 
@@ -37,9 +47,13 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 2. **下载安装**——从 Releases 拉取最新版，温和退出运行中的旧实例后替换升级
 3. **状态回馈**——自动启动应用，探测后端就绪状态，末尾输出 `KEY=VALUE` 摘要行（供 agent 直接解析）
 
-另有**只读体检模式**，随时给本机做一套应用体检（报告同样可发给 agent 自动处理）：
+另有**只读体检模式**，随时给本机做一套应用体检（报告同样可发给 agent 自动处理），同样双源任选：
 
 ```bash
+# 抢先源（iiiiiei，第一时间获取最新版）
+curl -fsSL https://raw.githubusercontent.com/iiiiiei/dsh-macos/main/install.sh | bash -s -- doctor
+
+# 稳定镜像源（Farverge，可能与抢先源存在同步延迟）
 curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh | bash -s -- doctor
 ```
 
@@ -64,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/Farverge/DSH-MacOS/main/install.sh 
 - **DSH 后端更新**：设置里一键检查——三级版本查询（npm 官方 → npmmirror → GitHub tags）、三级下载安装、更新前快照 + 兼容性自检 + 一键回滚；rc 稳定 / alpha 预发布双通道独立确认窗（展示官方发布说明与发布日期）
 - **认证链自动适配**：0.1.2-alpha 后端的浏览器认证链（launch token + 签名 Cookie）全自动换发，断连重连同样覆盖
 - **应用自更新**：应用本体检查 GitHub Releases，下载校验后自动换壳重启，旧版本备份可回退
-- **dsh-plugin-norm 协议层（可选生态组件）**：对外屏蔽官方版本漂移——家族插件只依赖其稳定面（caps 体检 / 会话跳转 / 事件通道），官方迭代适配收敛到一处
+- **dsh-plugin-norm 协议层（可选生态组件）**：对外屏蔽官方版本漂移——家族插件只依赖其稳定面（caps 体检 / 会话跳转 / 事件通道），官方迭代适配收敛到一处。独立选装（仓库 [iiiiiei/dsh-plugin-norm](https://github.com/iiiiiei/dsh-plugin-norm)），与 Launcher 分属两个独立仓库、分开选装，一键安装不附带；mini-dialog 0.2.1+ 的会话跳转依赖它（norm ≥ 1.0.1）
 - **桥接插件**：向系统注入服务器状态接口（pid / 版本 / 运行时长），并为插件生态预留原生通知通道
 - **可选菜单栏插件 DSH Launcher**：独立小应用，鲸鱼常驻菜单栏一键唤起
 

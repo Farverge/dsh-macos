@@ -17,10 +17,17 @@ import Foundation
 /// 顺序敏感性：插件同步必须放在最前——此刻 Launcher 仍活着、本应用也仍活着，
 /// 任一步出错都能完整回滚；一旦终止了 Launcher 进程，就再没有退路只能向前换壳。
 enum LauncherSelfUpdater {
+    /// 双发布源（与应用自更新同一策略）：iiiiiei = 抢先发布，Farverge = 组织稳定
+    /// 镜像（Actions 同步存在分钟级延迟）。双源意义：镜像可交叉验证用户实际拿到
+    /// 的版本，两源不一致时由 UI 弹窗交代差异而非静默择一。
+    static let primaryRepo = "iiiiiei/dsh-launcher"
+    static let mirrorRepo = "Farverge/dsh-launcher"
+
     struct Release {
         let tag: String            // 形如 v1.0.1
         let version: String        // 去掉 v 前缀
         let zipURL: URL?           // 稳定资产名 DSH.Launcher.zip（GitHub 把空格归一为点号）
+        let publishedAt: Date?     // published_at 解析结果（nil = 解析失败 → 弹窗显示「发布时间未知」）
     }
 
     /// 解包产物：.app 目录必在；插件目录可缺失（缺失仅跳过插件同步，不视为错误）
@@ -57,8 +64,9 @@ enum LauncherSelfUpdater {
     // MARK: ① 查询 Release
 
     /// 请求头/超时/无缓存与 AppSelfUpdater.fetchLatestRelease 完全一致。
-    static func fetchLatestRelease() async -> Release? {
-        guard let url = URL(string: "https://api.github.com/repos/iiiiiei/dsh-launcher/releases/latest") else { return nil }
+    /// repo 带默认值 = 主源（既有调用点零改动）；双源检查时由调用方传 mirrorRepo。
+    static func fetchLatestRelease(repo: String = "iiiiiei/dsh-launcher") async -> Release? {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -78,7 +86,8 @@ enum LauncherSelfUpdater {
                     return URL(string: link)
                 }.first
             }
-            return Release(tag: tag, version: version, zipURL: zipURL)
+            return Release(tag: tag, version: version, zipURL: zipURL,
+                           publishedAt: ReleaseTimeParser.parse(obj["published_at"] as? String))
         } catch {
             return nil
         }
