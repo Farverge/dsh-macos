@@ -15,6 +15,6 @@ jobs:
   sync:
     uses: iiiiiei/github-actions/.github/workflows/sync-core.yml@main
     with:
-      target_repo: Farverge/DSH-MacOS
+      target_repo: Farverge/dsh-macos
     secrets:
       TARGET_PAT: ${{ secrets.FARVERGE_ORG_TOKEN }}
