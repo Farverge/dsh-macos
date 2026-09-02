@@ -480,9 +480,9 @@ struct SettingsView: View {
     private func presentSourceMismatch<T>(component: String,
                                           primaryRepo: String, primary: T?,
                                           mirrorRepo: String, mirror: T?,
-                                          versionOf: (T) -> String,
-                                          publishedAtOf: (T) -> Date?,
-                                          compare: (String, String) -> Int) async -> T? {
+                                          versionOf: @escaping (T) -> String,
+                                          publishedAtOf: @escaping (T) -> Date?,
+                                          compare: @escaping (String, String) -> Int) async -> T? {
         // 选边：版本较新的一方为安装目标。仅单源存活时唯一解；版本打平但 tag 不一致
         // （写法差异等罕见情形）保守取主源——抢先源是发布的第一现场。
         let chosen: T
