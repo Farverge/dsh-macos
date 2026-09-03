@@ -152,6 +152,7 @@ struct SettingsView: View {
                         } else {
                             guard let chosen = await presentSourceMismatch(
                                 component: "DSH Desktop",
+                                localVersion: appVersion,
                                 primaryRepo: AppSelfUpdater.primaryRepo, primary: primary,
                                 mirrorRepo: AppSelfUpdater.mirrorRepo, mirror: mirror,
                                 versionOf: { $0.version }, publishedAtOf: { $0.publishedAt },
@@ -478,6 +479,7 @@ struct SettingsView: View {
     /// 返回：用户选定要安装的源（版本较新的一方）；nil = 用户点「取消」，中止本次检查。
     @MainActor
     private func presentSourceMismatch<T>(component: String,
+                                          localVersion: String,
                                           primaryRepo: String, primary: T?,
                                           mirrorRepo: String, mirror: T?,
                                           versionOf: @escaping (T) -> String,
@@ -504,14 +506,24 @@ struct SettingsView: View {
                 .map { "发布于 \($0)" } ?? "发布时间未知"
             return "\(repo)：v\(versionOf(release))（\(when)）"
         }
+        // 【本机版本门槛】两源不一致但本机已 ≥ 较新源（抢先装过/镜像滞后）时，
+        // 不提供安装——只说明差异，避免"提醒安装本机已有的版本"（真机反馈）。
+        let localIsCurrent = compare(localVersion, versionOf(chosen)) >= 0
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "发布源版本不一致：\(component)"
-        alert.informativeText = [line(primaryRepo, primary), line(mirrorRepo, mirror)]
-            .joined(separator: "\n")
-            + "\n\n将安装较新的 v\(versionOf(chosen))（来源 \(chosenRepo)）。镜像同步存在延迟属正常。"
-        alert.addButton(withTitle: "安装较新版本 v\(versionOf(chosen))")   // 首按钮 = default
-        alert.addButton(withTitle: "取消")
+        if localIsCurrent {
+            alert.informativeText = [line(primaryRepo, primary), line(mirrorRepo, mirror)]
+                .joined(separator: "\n")
+                + "\n\n本机已是最新 v\(localVersion)——无需安装。镜像源同步存在延迟属正常。"
+            alert.addButton(withTitle: "好")
+        } else {
+            alert.informativeText = [line(primaryRepo, primary), line(mirrorRepo, mirror)]
+                .joined(separator: "\n")
+                + "\n\n将安装较新的 v\(versionOf(chosen))（来源 \(chosenRepo)）。镜像同步存在延迟属正常。"
+            alert.addButton(withTitle: "安装较新版本 v\(versionOf(chosen))")   // 首按钮 = default
+            alert.addButton(withTitle: "取消")
+        }
         // sheet 锚定当前设置窗优先（形态与回滚弹窗一致）；拿不到 window 引用（窗口未
         // key 等边缘态）退回 runModal。检查态布尔值在弹窗期间保持 true，按钮维持禁用。
         let response: NSApplication.ModalResponse
@@ -552,6 +564,7 @@ struct SettingsView: View {
         } else {
             guard let chosen = await presentSourceMismatch(
                 component: "DSH Launcher",
+                localVersion: currentVersion,
                 primaryRepo: LauncherSelfUpdater.primaryRepo, primary: primary,
                 mirrorRepo: LauncherSelfUpdater.mirrorRepo, mirror: mirror,
                 versionOf: { $0.version }, publishedAtOf: { $0.publishedAt },
