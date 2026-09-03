@@ -3,10 +3,16 @@ import WebKit
 
 // MARK: - 数据结构
 
-/// 三级查询结果：稳定线 + 预发布线 + 实际命中的来源（诊断用）
+/// 三级查询结果：三条发布通道 + 官方发布时间映射 + 实际命中的来源（诊断用）
 struct UpdateAvailability {
     let stable: String?      // npm latest（三级兜底后所得；nil = 全部来源失败）
-    let alpha: String?       // npm alpha dist-tag（GitHub 兜底不解析预发布 → nil）
+    let alpha: String?       // npm alpha dist-tag（GitHub 兜底不解析 → nil）
+    let next: String?        // npm next dist-tag——官方 rc/预览通道（GitHub 兜底时为
+                             // 比稳定线更新的预发布 tag，无发布时间）
+    /// 版本 → 官方发布时间（npm packument 自带的 time 映射；GitHub 兜底为空表）。
+    /// 「按官方发布时间判断新旧」的数据源：dist-tag 挂哪个通道会滞后/错挂
+    /// （真机实锤：0.1.2-rc.1 挂 next，只看 latest/alpha 永远"已是最新"），发布时间不会。
+    let times: [String: Date]
     let source: QuerySource
 }
 
@@ -90,20 +96,26 @@ enum UpdateEngine {
     static let tarballBase = "https://registry.npmjs.org/@deepseek-ai/dsh/-"
 
     static func fetchAvailability() async -> UpdateAvailability {
-        // T1 / T2：registry 元数据（全量 JSON 较大但一次性，取 dist-tags 两个字段）
+        // T1 / T2：registry 元数据（全量 JSON 较大但一次性，取 dist-tags 三字段 + time 映射）
         for (base, source) in [(npmOfficial, QuerySource.official), (npmMirror, QuerySource.mirror)] {
             if let tags = await fetchDistTags(base) {
-                return UpdateAvailability(stable: tags.latest, alpha: tags.alpha, source: source)
+                return UpdateAvailability(stable: tags.latest, alpha: tags.alpha, next: tags.next,
+                                          times: tags.times, source: source)
             }
         }
-        // T3：GitHub tags 兜底（只保稳定线；tag 形如 dsh-v0.1.2-alpha.2）
-        if let stable = await fetchLatestGitHubTag() {
-            return UpdateAvailability(stable: stable, alpha: nil, source: .github)
-        }
-        return UpdateAvailability(stable: nil, alpha: nil, source: .official)
+        // T3：GitHub tags 兜底（无 time 映射 → times 空表，新旧判断退化为「版本 != 本机」；
+        // 稳定线照旧只认正式版，混列的较新预发布 tag 顺带解析为 next）
+        let fallback = await fetchGitHubTags()
+        return UpdateAvailability(stable: fallback.stable, alpha: nil, next: fallback.next,
+                                  times: [:], source: .github)
     }
 
-    private static func fetchDistTags(_ base: String) async -> (latest: String?, alpha: String?)? {
+    /// npm registry packument →（dist-tags 三字段，版本 → 官方发布时间）。
+    /// dist-tags 三通道：latest（稳定）/ alpha（抢先）/ next（官方 rc/预览）。
+    /// time 映射：npm 官方与 npmmirror 的 packument 均自带；created/modified 是
+    /// 元信息不是版本号，跳过；ISO8601 解析失败的条目丢弃（时间缺失只影响新旧
+    /// 判断的精度，不影响通道版本本身，绝不因此丢整个 packument）。
+    private static func fetchDistTags(_ base: String) async -> (latest: String?, alpha: String?, next: String?, times: [String: Date])? {
         guard let url = URL(string: "\(base)/@deepseek-ai/dsh") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
@@ -113,14 +125,35 @@ enum UpdateEngine {
             guard (response as? HTTPURLResponse)?.statusCode == 200,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tags = obj["dist-tags"] as? [String: String] else { return nil }
-            return (tags["latest"], tags["alpha"])
+            var times: [String: Date] = [:]
+            if let rawTimes = obj["time"] as? [String: String] {
+                for (version, raw) in rawTimes {
+                    guard version != "created", version != "modified",
+                          let date = ReleaseTimeParser.parse(raw) else { continue }
+                    times[version] = date
+                }
+            }
+            return (tags["latest"], tags["alpha"], tags["next"], times)
         } catch {
             return nil
         }
     }
 
-    private static func fetchLatestGitHubTag() async -> String? {
-        guard let url = URL(string: githubTags) else { return nil }
+    /// 是否预发布版本（SemVer 主版本号后带 "-pre" 段；构建元数据 +build 不算）
+    private static func isPrerelease(_ version: String) -> Bool {
+        let noBuild = version.split(separator: "+").first.map(String.init) ?? version
+        return noBuild.contains("-")
+    }
+
+    /// T3：GitHub tags →（稳定线，比稳定线更新的预发布）。tag 形如 dsh-v0.1.2-rc.1。
+    /// stable 取「正式版（无预发布后缀）」最大——与 npm latest 的语义对齐；旧实现取
+    /// 全列 SemVer 最大，核心号更高的 rc 会冒充稳定线（如只有 dsh-v0.1.2-rc.1 而无
+    /// dsh-v0.1.2 时，rc 被当稳定版送进稳定确认窗）。比 stable 更新的最高预发布解析
+    /// 为 next（GitHub 不提供发布时间，调用方置空 times）；alpha 恒为 nil——tags
+    /// 无法区分 alpha/next 通道归属。无正式版 tag 时退回全局最大（与旧实现一致，
+    /// 至少给出一个可用版本；两版本全失败时 stable/next 均为 nil，由上游判失败）。
+    private static func fetchGitHubTags() async -> (stable: String?, next: String?) {
+        guard let url = URL(string: githubTags) else { return (nil, nil) }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -130,15 +163,19 @@ enum UpdateEngine {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
-            // dsh-v 前缀剥掉后做 SemVer 取最大；alpha tag 混在同列里也天然小于同号正式版
+                  let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return (nil, nil) }
+            // dsh-v 前缀剥掉后做 SemVer 排序
             let versions = arr.compactMap { row -> String? in
                 guard let name = row["name"] as? String, name.hasPrefix("dsh-v") else { return nil }
                 return String(name.dropFirst("dsh-v".count))
             }
-            return versions.max { SemVer.compare($0, $1) < 0 }
+            guard !versions.isEmpty else { return (nil, nil) }
+            let top = { (list: [String]) -> String? in list.max { SemVer.compare($0, $1) < 0 } }
+            let stable = top(versions.filter { !isPrerelease($0) }) ?? top(versions)!
+            let next = top(versions.filter { isPrerelease($0) && SemVer.compare($0, stable) > 0 })
+            return (stable, next)
         } catch {
-            return nil
+            return (nil, nil)
         }
     }
 }

@@ -12,11 +12,11 @@ struct SettingsView: View {
     @State private var updateMessage: String?
     @State private var isUpdatingDSH = false
     @State private var isCheckingApp = false
-    @State private var pendingLatest: String?
     @State private var updateLog: [String] = []
     @State private var showUpdateLog = false
-    // v1.0.1：alpha 通道与自检回滚
-    @State private var pendingAlpha: String?
+    // 后端更新候选（按官方发布时间判断新旧）：主推走确认窗，其余候选各给一个
+    // 备选安装按钮（原 pendingLatest/pendingAlpha 单通道机制的泛化）
+    @State private var pendingAlternatives: [UpdateCandidate] = []
     @State private var selfCheckFailures: [CheckResult]?
     @State private var showRollbackConfirm = false
     // 应用自更新（v1.0.1）：确认弹窗 + 执行态
@@ -28,6 +28,22 @@ struct SettingsView: View {
     @State private var isCheckingLauncher = false
     @State private var isUpdatingLauncher = false
     @State private var launcherUpdateMessage: String?
+
+    /// 一次检查里单个通道的更新候选（主推/备选共用）
+    private struct UpdateCandidate: Identifiable {
+        let distTag: String       // npm dist-tag（latest/alpha/next），安装按此通道
+        let channelName: String   // 显示名：稳定通道 / alpha 抢先通道 / next 预览通道
+        let version: String
+        let publishedAt: Date?    // 官方发布时间（nil = 未知：packument 缺失或解析失败）
+        var id: String { "\(distTag)|\(version)" }
+    }
+
+    /// 通道注册表：dist-tag → 显示名（候选构造与安装按钮共用一套口径）
+    private static let updateChannels: [(distTag: String, name: String)] = [
+        ("latest", "稳定通道"),
+        ("alpha", "alpha 抢先通道"),
+        ("next", "next 预览通道"),
+    ]
 
     var body: some View {
         Form {
@@ -195,13 +211,13 @@ struct SettingsView: View {
         }
     }
 
-    /// DSH 更新 UI（v1.0.1：拆为小组件，规避 SwiftUI 大表达式类型检查超时）
+    /// DSH 更新 UI（拆为小组件，规避 SwiftUI 大表达式类型检查超时）
     @ViewBuilder
     private var dshUpdateControls: some View {
         updateStatusArea
         updateCheckButton
-        if let alpha = pendingAlpha {
-            alphaInstallButton(alpha)
+        ForEach(pendingAlternatives) { candidate in
+            altInstallButton(candidate)
         }
     }
 
@@ -235,7 +251,7 @@ struct SettingsView: View {
         }
     }
 
-    /// 检查按钮（rc 稳定版确认改走独立窗：handleCheckResult 命中后调 presentBackendUpdateConfirm）
+    /// 检查按钮（三通道候选判定后：主推走 presentBackendUpdateConfirm 独立窗）
     private var updateCheckButton: some View {
         Button(isUpdatingDSH ? "更新中…" : "检查 DSH 更新（联网拉最新版）") {
             guard !isUpdatingDSH else { return }
@@ -249,12 +265,16 @@ struct SettingsView: View {
         .background(rollbackAlertAnchor)   // 回滚弹窗锚点改挂背景（独立 Form 行曾渲染成空行）
     }
 
-    /// alpha 安装按钮（v1.0.2：确认改走独立窗，警示文案移入窗顶红字一行）
-    private func alphaInstallButton(_ alpha: String) -> some View {
-        Button("安装预发布版 \(alpha)…") {
+    /// 备选通道安装按钮（原 alpha 单按钮泛化）：每个未主推的候选一个，
+    /// 点按按该候选自己的通道走确认窗与安装管线
+    private func altInstallButton(_ candidate: UpdateCandidate) -> some View {
+        Button("安装 \(candidate.version)（\(candidate.channelName)）…") {
             presentBackendUpdateConfirm(
                 from: server.currentDSHVersion ?? "",
-                to: alpha, prerelease: true)
+                to: candidate.version,
+                prerelease: candidate.distTag != "latest",
+                distTag: candidate.distTag,
+                channelName: candidate.channelName)
         }
         .disabled(isUpdatingDSH)
     }
@@ -277,29 +297,100 @@ struct SettingsView: View {
             }
     }
 
-    /// 三级查询结果 → UI 状态
+    /// 三级查询结果 → UI 状态。按官方发布时间判断新旧 + 三通道候选选择。
+    ///
+    /// 【为什么弃用版本号/通道判断】官方 dist-tags 实况：latest=0.1.1-rc.2、
+    /// alpha=0.1.2-alpha.5、next=0.1.2-rc.1——rc 挂在 next 通道，旧实现只解析
+    /// latest/alpha 两字段再做 SemVer 比较，rc 新版永远报「已是最新」。发布时间
+    /// 是官方权威事实：候选发布时间晚于本机已装版本的发布时间即为「新于本机」，
+    /// 与它挂在哪个通道无关。
+    ///
+    /// 边界口径：
+    /// · 本机发布时间未知（times 缺此版本 / GitHub 兜底无 times / 版本未解析）
+    ///   → 退化为「版本 != 本机」即算候选；
+    /// · 候选发布时间未知 → 仍是候选，但排 在已知更新的候选之后（主推让位给时间确凿者）；
+    /// · 双方时间都已知且候选不晚于本机 → 丢弃（防旧版/同版本重发误报）；
+    /// · 候选发布时间全未知 → 主推退回 SemVer 最大者。
     private func handleCheckResult(_ result: Result<UpdateAvailability, Error>) {
         isUpdatingDSH = false
+        pendingAlternatives = []
         switch result {
         case .success(let availability):
-            let current = server.currentDSHVersion ?? ""
-            let upToDate = availability.stable.map { current.isEmpty || SemVer.compare(current, $0) >= 0 } ?? true
-            pendingAlpha = nil
-            if upToDate {
-                updateMessage = "DSH 已是最新版本（\(availability.source.rawValue)）"
-            } else if let stable = availability.stable {
-                pendingLatest = stable
-                updateMessage = "发现新版本 \(stable)（当前 \(current.isEmpty ? "未解析" : current)，稳定版通道）。确认后才会更新重启。"
-                presentBackendUpdateConfirm(from: current, to: stable, prerelease: false)
-            }
-            if let alpha = availability.alpha,
-               current.isEmpty || SemVer.compare(current, alpha) < 0 {
-                pendingAlpha = alpha
-                updateMessage = (updateMessage ?? "") + "\n发现预发布 \(alpha)（alpha 通道 · 体验新特性，可能不稳定）。"
-            }
+            presentAvailability(availability)
         case .failure(let e):
             updateMessage = "检查失败：\(e.localizedDescription)"
         }
+    }
+
+    /// 时间判断 + 候选选择：三通道各自 non-nil 且版本精确 ≠ 本机者组成候选集
+    /// （精确相等过滤——dist-tag 指回本机版本的重发不提示），经「新于本机」过滤后
+    /// 按发布时间降序：主推弹确认窗，其余罗列 + 备选按钮。
+    private func presentAvailability(_ availability: UpdateAvailability) {
+        let current = server.currentDSHVersion ?? ""
+        let currentTime = current.isEmpty ? nil : availability.times[current]
+        let all = Self.updateChannels.compactMap { channel -> UpdateCandidate? in
+            guard let version = channelVersion(availability, channel.distTag),
+                  version != current else { return nil }
+            return UpdateCandidate(distTag: channel.distTag, channelName: channel.name,
+                                   version: version, publishedAt: availability.times[version])
+        }
+        // 新于本机过滤：本机时间未知 → 退化（全保留）；候选时间未知 → 无从否定，
+        // 保留（排序上让位）；双方已知 → 须严格晚于本机
+        let candidates = all.filter { candidate in
+            guard let currentTime else { return true }
+            guard let publishedAt = candidate.publishedAt else { return true }
+            return publishedAt > currentTime
+        }
+        guard !candidates.isEmpty else {
+            updateMessage = "DSH 已是最新版本（\(availability.source.rawValue)）"
+            return
+        }
+        let sorted = sortCandidates(candidates)
+        let primary = sorted[0]
+        let rest = Array(sorted.dropFirst())
+        pendingAlternatives = rest
+        let currentText = current.isEmpty ? "未解析" : current
+        updateMessage = "发现新版本 \(primary.version)（\(primary.channelName)，"
+            + "\(publishLine(primary.publishedAt))；当前 \(currentText)）。确认后才会更新重启。"
+        if !rest.isEmpty {
+            let lines = rest.map { "· \($0.channelName) \($0.version)（\(publishLine($0.publishedAt))）" }
+            updateMessage = (updateMessage ?? "")
+                + "\n其他通道候选（可点下方按钮安装）：\n" + lines.joined(separator: "\n")
+        }
+        presentBackendUpdateConfirm(
+            from: current, to: primary.version,
+            prerelease: primary.distTag != "latest",
+            distTag: primary.distTag, channelName: primary.channelName)
+    }
+
+    /// dist-tag → availability 对应通道字段（通道注册表的取值侧）
+    private func channelVersion(_ availability: UpdateAvailability, _ distTag: String) -> String? {
+        switch distTag {
+        case "latest": return availability.stable
+        case "alpha": return availability.alpha
+        case "next": return availability.next
+        default: return nil
+        }
+    }
+
+    /// 候选排序：已知发布时间者按时间降序排前（并列时 SemVer 兜底）；时间未知者
+    /// 排在其后、按 SemVer 降序——候选时间全未知时主推即版本号最大者。
+    private func sortCandidates(_ candidates: [UpdateCandidate]) -> [UpdateCandidate] {
+        candidates.sorted { a, b in
+            switch (a.publishedAt, b.publishedAt) {
+            case (let ta?, let tb?):
+                return ta != tb ? ta > tb : SemVer.compare(a.version, b.version) > 0
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none):
+                return SemVer.compare(a.version, b.version) > 0
+            }
+        }
+    }
+
+    /// 发布时间 → 「发布于 YYYY-MM-DD」/「发布时间未知」（展示性信息，缺省不阻断）
+    private func publishLine(_ date: Date?) -> String {
+        date.flatMap(ReleaseTimeParser.dayString).map { "发布于 \($0)" } ?? "发布时间未知"
     }
 
     // MARK: - 更新确认独立窗接线（v1.0.2）
@@ -307,16 +398,29 @@ struct SettingsView: View {
     // 原样复用，这里只换"确认壳"：开窗 → 并行预取 notes → 到达后刷新窗内文本
     // （预取未就绪先显示"加载中…"，失败静默降级为"官方未提供"）。
 
-    /// 后端确认窗（rc 稳定版 / alpha 预发布共用）：确认回调才触发原更新管线
-    /// 后端确认窗（rc 稳定版 / alpha 预发布共用）：确认回调才触发原更新管线。
-    /// 全部固定文案取自 UpdateCopy 目录（v1.0.5 去硬编码）。
-    private func presentBackendUpdateConfirm(from current: String, to latest: String, prerelease: Bool) {
+    /// 后端确认窗（稳定 / alpha / next 三通道共用）：确认回调才触发原更新管线。
+    /// 全部固定文案取自 UpdateCopy 目录（去硬编码）。channelName 非空时在窗标题
+    /// 尾部与红字警示注明通道（稳定通道维持历史文案，不额外标注）；distTag 决定
+    /// 安装通道（latest/alpha/next），不再由 prerelease 推导——next 通道 rc 版
+    /// 也走预发布确认窗（prerelease: true）。
+    private func presentBackendUpdateConfirm(from current: String, to latest: String,
+                                             prerelease: Bool, distTag: String = "latest",
+                                             channelName: String? = nil) {
+        let title = UpdateCopy.backendTitle(prerelease: prerelease)
+            + (channelName.map { "· \($0)" } ?? "")
+        let warning: String?
+        if prerelease {
+            warning = channelName.map { "【\($0)】" + UpdateCopy.backendPrereleaseWarning }
+                ?? UpdateCopy.backendPrereleaseWarning
+        } else {
+            warning = nil
+        }
         let token = UpdateConfirmWindowController.shared.show(
             config: .init(
-                title: UpdateCopy.backendTitle(prerelease: prerelease),
+                title: title,
                 fromVersion: current,
                 toVersion: latest,
-                warning: prerelease ? UpdateCopy.backendPrereleaseWarning : nil,
+                warning: warning,
                 // 影响面按目标版本门控（认证链自 0.1.2-alpha.1 起才有）
                 warningDetail: prerelease
                     ? UpdateCopy.backendPrereleaseWarningDetail(for: latest)
@@ -324,7 +428,7 @@ struct SettingsView: View {
                 footnote: UpdateCopy.backendFootnote(prerelease: prerelease),
                 confirmTitle: UpdateCopy.backendConfirmTitle(prerelease: prerelease)),
             notes: nil) {
-            startUpdate(distTag: prerelease ? "alpha" : "latest", version: latest)
+            startUpdate(distTag: distTag, version: latest, channelName: channelName)
         }
         prefetchNotes(repo: UpdateNotesEngine.dshUpstream, from: current, to: latest, token: token)
     }
@@ -352,14 +456,14 @@ struct SettingsView: View {
         }
     }
 
-    /// 统一启动更新/安装（rc 与 alpha 共用管线，弹窗已在上游区分）
-    private func startUpdate(distTag: String, version: String) {
+    /// 统一启动更新/安装（三通道共用管线，弹窗已在上游区分）
+    private func startUpdate(distTag: String, version: String, channelName: String? = nil) {
         isUpdatingDSH = true
         updateLog = []
         showUpdateLog = true
         updateMessage = distTag == "latest"
             ? "正在更新到 \(version)，下载进度见下方终端…"
-            : "正在安装预发布版 \(version)（alpha 通道）…"
+            : "正在安装预发布版 \(version)（\(channelName ?? "alpha 抢先通道")）…"
         server.onUpdateProgress = { line in updateLog.append(line) }
         server.applyDSHUpdate(distTag: distTag, version: version) { r in
             server.onUpdateProgress = nil
