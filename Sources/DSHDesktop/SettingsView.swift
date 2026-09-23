@@ -347,9 +347,14 @@ struct SettingsView: View {
             return UpdateCandidate(distTag: channel.distTag, channelName: channel.name,
                                    version: version, publishedAt: availability.times[version])
         }
+        // 同版本去重：npm 多 dist-tag 指向同一版本（如 latest=next=0.1.5-rc.3）时
+        // 只保留首个通道的按钮，避免出现两个「安装 同版本」重复项（2026-09-22
+        // 用户截图像素实鉴；三通道序 latest→next→alpha，保留靠前者即官方主通道）
+        var seenVersions = Set<String>()
+        let deduped = all.filter { seenVersions.insert($0.version).inserted }
         // 新于本机过滤：本机时间未知 → 退化（全保留）；候选时间未知 → 无从否定，
         // 保留（排序上让位）；双方已知 → 须严格晚于本机
-        let candidates = all.filter { candidate in
+        let candidates = deduped.filter { candidate in
             guard let currentTime else { return true }
             guard let publishedAt = candidate.publishedAt else { return true }
             return publishedAt > currentTime
