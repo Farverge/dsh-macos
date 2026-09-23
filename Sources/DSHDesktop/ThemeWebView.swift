@@ -83,6 +83,7 @@ final class ThemeWebView: WKWebView {
     private static let domProbeJS = "document.documentElement.getAttribute('data-theme-ready') || ''"
 
     let themeID: String
+    private var downloadDestination: URL?
     weak var poolDelegate: ThemeWebViewDelegate?
 
     private(set) var handshake: ThemeHandshake?
@@ -276,4 +277,68 @@ extension ThemeWebView: WKNavigationDelegate, WKUIDelegate {
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         decisionHandler(.grant)
     }
+
+    // MARK: 通用下载（下载日志 / 导出等）
+    // 此前只特判 /api/session.export（主题页时代），0.1.7 官方 UI 的「下载日志」
+    // 等按钮发起的 blob/attachment 下载在 WKWebView 里没人接——默认静默丢弃，
+    // 表现为「点了没反应」（2026-09-24 用户实鉴）。补齐标准下载链：响应不可
+    // 渲染 → .download 策略 → WKDownloadDelegate 落 ~/Downloads 并在 Finder reveal
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    /// 唯一化文件名（重名自动加 -1/-2 后缀），返回完整目标路径
+    private static func uniqueDestination(_ filename: String) -> URL {
+        let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        var dest = dir.appendingPathComponent(filename)
+        let stem = dest.deletingPathExtension().lastPathComponent
+        let ext = dest.pathExtension
+        var n = 1
+        while FileManager.default.fileExists(atPath: dest.path) {
+            dest = dir.appendingPathComponent("\(stem)-\(n)\(ext.isEmpty ? "" : ".\(ext)")")
+            n += 1
+        }
+        return dest
+    }
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let dest = Self.uniqueDestination(suggestedFilename.isEmpty ? "download" : suggestedFilename)
+        downloadDestination = dest
+        completionHandler(dest)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let dest = downloadDestination else { return }
+        Task { @MainActor in
+            NSApp.activate(ignoringOtherApps: true)
+            NSWorkspace.shared.selectFile(dest.path, inFileViewerRootedAtPath: dest.deletingLastPathComponent().path)
+        }
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        let name = downloadDestination?.lastPathComponent ?? "文件"
+        Task { @MainActor in
+            let alert = NSAlert()
+            alert.messageText = "下载失败"
+            alert.informativeText = "\(name)：\(error.localizedDescription)"
+            alert.runModal()
+        }
+    }
 }
+
+extension ThemeWebView: WKDownloadDelegate {}
