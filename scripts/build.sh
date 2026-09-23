@@ -66,6 +66,11 @@ cp "$ROOT/Resources/whale.svg" "$APP/Contents/Resources/whale.svg"
 mkdir -p "$APP/Contents/Resources/overlays"
 cp "$ROOT"/Resources/overlays/*.js "$APP/Contents/Resources/overlays/"
 
+echo "==> [3.5/4] strip 本地符号（1.7M→1.0M，2026-09-24 瘦身）"
+# strip -x 只去本地符号表，保留动态链接符号——Swift 标准发行做法，须在
+# codesign 之前执行（符号表变化会使旧签名失效）
+strip -x "$APP/Contents/MacOS/DSHDesktop"
+
 echo "==> [4/4] codesign（稳定化 ad-hoc）"
 # 显式指定基于 identifier 的 Designated Requirement：身份不再随每次编译的
 # cdhash 漂移，TCC 授权（辅助功能等）跨构建/跨版本持续有效。
